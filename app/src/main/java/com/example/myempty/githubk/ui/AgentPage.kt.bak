@@ -1,0 +1,603 @@
+package com.example.myempty.githubk.ui
+
+import android.graphics.Color
+import android.graphics.Typeface
+import android.view.Gravity
+import android.view.View
+import android.view.inputmethod.EditorInfo
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import com.example.myempty.githubk.ai.ChatMessage
+import com.example.myempty.githubk.core.Project
+import com.example.myempty.githubk.ai.AgentProtocol
+
+/**
+ * AgentPage v3.0：AI 工作环境 — 对话 + 任务双模式。
+ *
+ * 对话模式：自由聊天，AI 可调用工具自动完成操作。
+ * 任务模式：描述任务 → Agent 多轮自动执行（工具调用 + 文件写入 + 构建）。
+ */
+class AgentPage(private val host: PageHost) {
+
+    private val state = host.state
+    private lateinit var logBox: LinearLayout
+    private lateinit var taskInput: EditText
+    private lateinit var statusProvider: TextView
+    private lateinit var statusProject: TextView
+    private lateinit var statusMcp: TextView
+    private lateinit var statusSkill: TextView
+    private lateinit var mcpToolsBox: LinearLayout
+    private lateinit var skillsBox: LinearLayout
+    private var runBtn: android.widget.Button? = null
+    private var running = false
+    private var selectedProject: String? = null
+
+    // 对话模式
+    private lateinit var chatBox: LinearLayout
+    private lateinit var chatInput: EditText
+    private lateinit var chatScroll: ScrollView
+    private val chatHistory = mutableListOf<ChatMessage>()
+    private var chatMode = false
+
+    fun buildView(): View {
+        val root = UiKit.vstack(host.context).apply {
+            setPadding(UiKit.dp(host.context, 14), UiKit.dp(host.context, 12), UiKit.dp(host.context, 14), UiKit.dp(host.context, 8))
+        }
+        root.addView(UiKit.pageHeader(host.context, "AI 工作环境", "对话交互 / 自动完成任务 / MCP 工具 / Skill 工作流", null))
+
+        // ---- 状态面板 ----
+        root.addView(statusPanel())
+        root.addView(UiKit.spacer(host.context, 8))
+
+        // ---- 模式切换 ----
+        root.addView(UiKit.hstack(host.context).apply {
+            addView(UiKit.chip(host.context, "对话模式", chatMode) { chatMode = true; host.rebuildAll() })
+            addView(UiKit.spacer(host.context, 6))
+            addView(UiKit.chip(host.context, "任务模式", !chatMode) { chatMode = false; host.rebuildAll() })
+            addView(UiKit.spacer(host.context, 6))
+            addView(UiKit.ghostButton(host.context, "配置 AI") { host.pushPage(AiSettingsPage(host).buildView()) })
+            addView(UiKit.spacer(host.context, 6))
+            addView(UiKit.ghostButton(host.context, "选择项目") { chooseProject() })
+        })
+        root.addView(UiKit.spacer(host.context, 8))
+
+        if (chatMode) {
+            buildChatMode(root)
+        } else {
+            buildTaskMode(root)
+        }
+        return root
+    }
+
+    /** 对话模式：自由聊天 + AI 可调用工具自动完成操作 */
+    private fun buildChatMode(root: LinearLayout) {
+        // ---- 对话记录区 ----
+        root.addView(UiKit.section(host.context, "对话"))
+        chatScroll = ScrollView(host.context).apply { isFillViewport = true }
+        chatBox = UiKit.vstack(host.context)
+        chatScroll.addView(chatBox)
+        root.addView(chatScroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        // 欢迎消息
+        appendChatMessage("assistant", "你好！我是 GitHubK Studio AI 助手。\n可以帮你：\n• 编写和修改代码\n• 分析项目结构\n• 构建 Android/Flutter 项目\n• 管理 GitHub 仓库\n• 执行终端命令\n\n直接告诉我你想做什么。")
+
+        // ---- 快捷操作 ----
+        root.addView(UiKit.spacer(host.context, 4))
+        root.addView(UiKit.hstack(host.context).apply {
+            addView(UiKit.ghostButton(host.context, "分析项目") { sendChat("请分析当前项目的文件结构和主要功能") })
+            addView(UiKit.spacer(host.context, 4))
+            addView(UiKit.ghostButton(host.context, "构建项目") { sendChat("请构建当前项目并报告结果") })
+            addView(UiKit.spacer(host.context, 4))
+            addView(UiKit.ghostButton(host.context, "清空对话") {
+                chatBox.removeAllViews()
+                chatHistory.clear()
+                appendChatMessage("assistant", "对话已清空。")
+            })
+        })
+        root.addView(UiKit.spacer(host.context, 6))
+
+        // ---- 输入栏 ----
+        val inputRow = UiKit.hstack(host.context)
+        chatInput = EditText(host.context).apply {
+            hint = "输入消息..."
+            setSingleLine(true)
+            textSize = 13f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_SEND || actionId == EditorInfo.IME_ACTION_DONE) {
+                    sendChat(chatInput.text.toString())
+                    true
+                } else false
+            }
+        }
+        inputRow.addView(chatInput)
+        inputRow.addView(UiKit.spacer(host.context, 6))
+        inputRow.addView(UiKit.button(host.context, "发送") { sendChat(chatInput.text.toString()) })
+        root.addView(inputRow)
+    }
+
+    /** 任务模式：描述任务 → Agent 自动执行 */
+    private fun buildTaskMode(root: LinearLayout) {
+        // 整页可滚动：确保下方工作流工具（MCP + Skill）无论多少个都完整显示，
+        // 不再被固定高度截断 / 压缩，解决“工作流工具显示不全”。
+        val pageScroll = ScrollView(host.context).apply {
+            isFillViewport = true
+            isVerticalScrollBarEnabled = true
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+        }
+        val page = UiKit.vstack(host.context)
+        pageScroll.addView(page)
+
+        // ---- 操作行 ----
+        page.addView(UiKit.hstack(host.context).apply {
+            addView(UiKit.ghostButton(host.context, "环境中心") { host.openTerminal() })
+            addView(UiKit.spacer(host.context, 8))
+            addView(UiKit.ghostButton(host.context, "ZeroTermux") { host.pushPage(ZeroTermuxPage(host).buildView()) })
+        })
+        page.addView(UiKit.spacer(host.context, 8))
+
+        // ---- 快速任务：一键触发完整生命周期（新建/构建/导出APK/打包源码）----
+        page.addView(UiKit.section(host.context, "快速任务"))
+        page.addView(quickTaskRow())
+        page.addView(UiKit.spacer(host.context, 8))
+
+        // ---- 任务输入 ----
+        taskInput = UiKit.textArea(host.context, "例如：新建一个 Android 计数器项目并构建打包APK；或：用 MCP 工具查询仓库信息后修改源码并打包源码")
+        page.addView(taskInput)
+        page.addView(UiKit.spacer(host.context, 8))
+
+        // ---- 执行 ----
+        page.addView(UiKit.hstack(host.context).apply {
+            addView(UiKit.button(host.context, "▶ 执行任务") { startTask() }.apply {
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                runBtn = this
+            })
+            addView(UiKit.spacer(host.context, 8))
+            addView(UiKit.ghostButton(host.context, "清空日志") { logBox.removeAllViews() })
+        })
+        page.addView(UiKit.spacer(host.context, 8))
+
+        // ---- 工具调用日志：固定 ~40% 高度内部滚动，保留最近输出可读 ----
+        page.addView(UiKit.section(host.context, "工具调用日志"))
+        val logScroll = ScrollView(host.context).apply {
+            isFillViewport = false
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, UiKit.dp(host.context, 190))
+        }
+        logBox = UiKit.vstack(host.context)
+        logScroll.addView(logBox)
+        page.addView(logScroll)
+
+        // ---- 工作流工具区：完整自然展开（不截断、可整页滚动查看）----
+        page.addView(UiKit.spacer(host.context, 4))
+        page.addView(UiKit.section(host.context, "工作流工具"))
+        mcpToolsBox = UiKit.vstack(host.context).apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        }
+        skillsBox = UiKit.vstack(host.context).apply {
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        }
+        page.addView(mcpToolsBox)
+        page.addView(UiKit.spacer(host.context, 6))
+        page.addView(skillsBox)
+
+        root.addView(pageScroll)
+        refreshToolSection()
+    }
+
+    /** 发送对话消息 */
+    private fun sendChat(text: String) {
+        val msg = text.trim()
+        if (msg.isBlank()) return
+        val cfg0 = state.ai.config()
+        if (!cfg0.enabled) { host.toast("AI 已停用，请先到 AI 配置中心开启"); return }
+        if (cfg0.key.isBlank() && !state.ai.keyOptional(cfg0.provider)) { host.toast("请先配置 AI API Key"); return }
+        if (running) { host.toast("AI 正在处理中，请稍候"); return }
+
+        appendChatMessage("user", msg)
+        chatInput.setText("")
+
+        running = true
+        val project: Project? = selectedProject?.let { state.workspace.project(it) }
+        val ctx = if (project != null) state.workspace.agentContext(project) else state.workspace.agentContext(null)
+        val system = """You are GitHubK Studio AI assistant, a mobile coding agent.
+Workspace context:
+$ctx
+
+You can help with:
+- Writing, reading, and modifying code
+- Building Android/Flutter projects
+- Managing GitHub repositories
+- Running terminal commands
+- Answering programming questions
+
+You can call tools by returning exactly:
+<TOOL name="tool_name">{"path":"...","query":"..."}</TOOL>
+Available tools: list_projects, list_files, file_tree, read_file, write_file, search_code, delete_file, build, git_status, git_diff, git_branch, git_commit, git_push.
+
+You can write files by returning:
+<FILE path="projectName/relative/path">full file content</FILE>
+
+Rules:
+- projectName MUST be an existing project from list_projects.
+- Write complete files, never partial snippets.
+- After code changes, suggest running build to verify.
+- Be concise and helpful. Use Chinese if the user speaks Chinese."""
+
+        Thread {
+            try {
+                chatHistory.add(ChatMessage("user", msg))
+                val r = state.ai.chatDetailed(chatHistory, system)
+                val reply = r.content
+                chatHistory.add(ChatMessage("assistant", reply))
+                if (r.reasoning.isNotBlank()) {
+                    host.runUi { appendThinkingMessage(r.reasoning) }
+                }
+
+                // Process any tool calls or file writes
+                val tools = AgentProtocol.parseTools(reply)
+                val files = AgentProtocol.parseFiles(reply)
+                val hasActions = tools.isNotEmpty() || files.isNotEmpty()
+
+                if (hasActions && project != null) {
+                    // Execute tool calls
+                    val toolResults = StringBuilder()
+                    tools.forEach { tc ->
+                        val result = state.dispatcher.execute(project, tc.name, tc.args)
+                        toolResults.append("Tool ${tc.name}: ${result.take(2000)}\n")
+                    }
+                    // Execute file writes
+                    files.forEach { fw ->
+                        val projectName = fw.path.replace('\\', '/').trim().removePrefix("/").substringBefore('/')
+                        val p = state.workspace.project(projectName)
+                        if (p != null) {
+                            val rel = fw.path.replace('\\', '/').trim().removePrefix("/").substringAfter('/', "")
+                            if (state.workspace.writeSafe(p, rel, fw.content)) {
+                                toolResults.append("File written: ${p.name}/$rel\n")
+                            }
+                        }
+                    }
+                    if (toolResults.isNotBlank()) {
+                        chatHistory.add(ChatMessage("user", "Tool/file results:\n${toolResults.toString().take(3000)}"))
+                        // Let AI process the results
+                        val reply2 = state.ai.chat(chatHistory, system)
+                        chatHistory.add(ChatMessage("assistant", reply2))
+                        val cleanReply = AgentProtocol.stripTags(reply2)
+                        host.runUi { appendChatMessage("assistant", cleanReply.ifBlank { reply2 }) }
+                    } else {
+                        host.runUi { appendChatMessage("assistant", AgentProtocol.stripTags(reply).ifBlank { reply }) }
+                    }
+                } else {
+                    val cleanReply = AgentProtocol.stripTags(reply)
+                    host.runUi { appendChatMessage("assistant", cleanReply.ifBlank { reply }) }
+                }
+            } catch (e: Throwable) {
+                host.runUi { appendChatMessage("assistant", "错误：${e.message ?: "AI 请求失败"}") }
+            } finally {
+                host.runUi { running = false }
+            }
+        }.start()
+    }
+
+    /** 思考链气泡（灰色小字）。 */
+    private fun appendThinkingMessage(reasoning: String) {
+        val bubble = TextView(host.context).apply {
+            text = "🤔 思考过程\n" + reasoning
+            textSize = 10.5f
+            typeface = Typeface.DEFAULT
+            setTextColor(Color.rgb(170, 170, 180))
+            setBackgroundColor(Color.rgb(30, 30, 36))
+            setPadding(UiKit.dp(host.context, 10), UiKit.dp(host.context, 6), UiKit.dp(host.context, 10), UiKit.dp(host.context, 6))
+            val params = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            params.bottomMargin = UiKit.dp(host.context, 4)
+            layoutParams = params
+        }
+        chatBox.addView(bubble)
+        chatBox.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    /** 在对话区追加一条消息 */
+    private fun appendChatMessage(role: String, text: String) {
+        host.runUi {
+            val isUser = role == "user"
+            val bubble = TextView(host.context).apply {
+                this.text = text
+                textSize = 12f
+                typeface = if (isUser) Typeface.DEFAULT_BOLD else Typeface.MONOSPACE
+                setTextColor(if (isUser) Color.rgb(20, 20, 20) else Color.rgb(232, 232, 232))
+                setBackgroundColor(if (isUser) Color.rgb(100, 180, 255) else Color.rgb(45, 45, 45))
+                setPadding(UiKit.dp(host.context, 12), UiKit.dp(host.context, 8), UiKit.dp(host.context, 12), UiKit.dp(host.context, 8))
+                val params = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                params.bottomMargin = UiKit.dp(host.context, 6)
+                layoutParams = params
+            }
+            chatBox.addView(bubble)
+            chatBox.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
+        }
+    }
+
+    /** 刷新 MCP 工具与 Skill 快捷列表（异步）。 */
+    private fun refreshToolSection() {
+        mcpToolsBox.removeAllViews()
+        val servers = try {
+            state.mcp.allEnabledServers()
+        } catch (e: Throwable) {
+            appendLog("MCP 加载失败: ${e.message}", com.example.myempty.githubk.R.color.muted)
+            emptyList()
+        }
+
+        if (servers.isEmpty()) {
+            mcpToolsBox.addView(UiKit.hstack(host.context).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+                setPadding(UiKit.dp(host.context, 6), UiKit.dp(host.context, 2), UiKit.dp(host.context, 6), UiKit.dp(host.context, 2))
+                addView(UiKit.label(
+                    host.context,
+                    "MCP：未启用服务",
+                    color = com.example.myempty.githubk.R.color.muted,
+                    size = 11f
+                ).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                })
+                addView(UiKit.ghostButton(host.context, "去配置") { host.switchTab(3) })
+            })
+        } else {
+            servers.forEach { s ->
+                mcpToolsBox.addView(UiKit.hstack(host.context).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    )
+                    setPadding(UiKit.dp(host.context, 6), UiKit.dp(host.context, 4), UiKit.dp(host.context, 6), UiKit.dp(host.context, 4))
+                    addView(UiKit.label(host.context, s.name, color = com.example.myempty.githubk.R.color.accent, size = 12f).apply {
+                        layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        maxLines = 1
+                    })
+                    addView(UiKit.ghostButton(host.context, "测试") {
+                        Thread {
+                            try {
+                                val tools = state.mcp.listTools(s)
+                                host.runUi {
+                                    val toolList = tools.joinToString(", ") { it.name }
+                                    appendLog("OK ${s.name}: $toolList", com.example.myempty.githubk.R.color.success)
+                                    host.toast("${s.name}: ${tools.size} 个工具")
+                                }
+                            } catch (e: Throwable) {
+                                host.runUi {
+                                    appendLog("FAIL ${s.name}: ${e.message}", com.example.myempty.githubk.R.color.muted)
+                                }
+                            }
+                        }.start()
+                    })
+                })
+                mcpToolsBox.addView(UiKit.spacer(host.context, 4))
+            }
+        }
+
+        skillsBox.removeAllViews()
+        val skills = try {
+            state.skill.list()
+        } catch (e: Throwable) {
+            appendLog("Skill 加载失败: ${e.message}", com.example.myempty.githubk.R.color.muted)
+            emptyList()
+        }
+
+        if (skills.isEmpty()) {
+            skillsBox.addView(UiKit.label(
+                host.context,
+                "Skill：暂无工作流（可在设置中添加）",
+                color = com.example.myempty.githubk.R.color.muted,
+                size = 11f
+            ))
+        } else {
+            // 每行一个工作流：名称 + 描述 + 运行按钮，完整展开
+            skills.forEach { s ->
+                skillsBox.addView(UiKit.vstack(host.context).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    )
+                    background = UiKit.rounded(host.context, UiKit.themeColor(host.context, com.example.myempty.githubk.R.color.surface_elevated), 10, UiKit.themeColor(host.context, com.example.myempty.githubk.R.color.divider), 1)
+                    setPadding(UiKit.dp(host.context, 10), UiKit.dp(host.context, 6), UiKit.dp(host.context, 10), UiKit.dp(host.context, 6))
+                    addView(UiKit.hstack(host.context).apply {
+                        addView(UiKit.label(host.context, s.name, color = com.example.myempty.githubk.R.color.accent, size = 13f).apply {
+                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        })
+                        addView(UiKit.label(host.context, "[${s.id}]", color = com.example.myempty.githubk.R.color.muted, size = 10f))
+                        addView(UiKit.spacer(host.context, 4))
+                        addView(UiKit.ghostButton(host.context, "运行") { runSkill(s.id) })
+                    })
+                    s.description?.let { desc ->
+                        if (desc.isNotBlank()) {
+                            addView(UiKit.label(host.context, desc, color = com.example.myempty.githubk.R.color.muted, size = 11f).apply {
+                                setPadding(0, UiKit.dp(host.context, 2), 0, 0)
+                            })
+                        }
+                    }
+                })
+                skillsBox.addView(UiKit.spacer(host.context, 4))
+            }
+        }
+    }
+
+    private fun runSkill(sid: String) {
+        val project = selectedProject?.let { state.workspace.project(it) }
+        if (project == null) { host.toast("请先选择项目"); return }
+        if (running) { host.toast("Agent 正在运行中"); return }
+        running = true
+        runBtn?.isEnabled = false
+        appendLog("Run Skill: $sid @ ${project.name}", com.example.myempty.githubk.R.color.accent)
+        Thread {
+            val result = state.skill.execute(sid, project) { line ->
+                appendLog(line, com.example.myempty.githubk.R.color.on_surface)
+            }
+            host.runUi {
+                appendLog(result.take(2000), com.example.myempty.githubk.R.color.success)
+                running = false
+                runBtn?.isEnabled = true
+            }
+        }.start()
+    }
+
+    private fun statusPanel(): View {
+        val cfg = state.ai.config()
+        val projects = state.workspace.projects()
+        val mcpCount = state.mcp.allEnabledServers().size
+        val skillCount = state.skill.list().size
+        val content = UiKit.vstack(host.context)
+        content.addView(UiKit.hstack(host.context).apply {
+            addView(statCell("AI", if (!cfg.enabled) "已停用" else cfg.provider.ifBlank { "未配置" },
+                if (!cfg.enabled) com.example.myempty.githubk.R.color.muted
+                else if (cfg.key.isNotBlank()) com.example.myempty.githubk.R.color.success else com.example.myempty.githubk.R.color.warning))
+            addView(UiKit.spacer(host.context, 8))
+            addView(statCell("项目", selectedProject ?: if (projects.isNotEmpty()) projects.first().name else "未选择", com.example.myempty.githubk.R.color.on_surface))
+            addView(UiKit.spacer(host.context, 8))
+            addView(statCell("MCP", "$mcpCount 个服务", if (mcpCount > 0) com.example.myempty.githubk.R.color.success else com.example.myempty.githubk.R.color.muted))
+            addView(UiKit.spacer(host.context, 8))
+            addView(statCell("Skill", "$skillCount 个工作流", if (skillCount > 0) com.example.myempty.githubk.R.color.accent else com.example.myempty.githubk.R.color.muted))
+        })
+        return UiKit.card(host.context, content)
+    }
+
+    private fun statCell(label: String, value: String, colorRes: Int): LinearLayout =
+        UiKit.vstack(host.context).apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            addView(UiKit.label(host.context, label, color = com.example.myempty.githubk.R.color.muted, size = 10.5f))
+            addView(UiKit.label(host.context, value.take(14), color = colorRes, size = 12.5f).apply { maxLines = 1 })
+        }
+
+    private fun refreshStatus() {
+        host.rebuildAll()
+    }
+
+    private fun appendLog(text: String, color: Int = com.example.myempty.githubk.R.color.on_surface) {
+        host.runUi {
+            logBox.addView(UiKit.mono(host.context, text).apply {
+                setTextColor(UiKit.themeColor(host.context, color))
+                textSize = 11f
+            })
+            logBox.addView(UiKit.spacer(host.context, 4))
+        }
+    }
+
+    /**
+     * 快速任务行：把 create_project / build / export_apk / package_source 组合成
+     * 一键可点的常见开发者动作，点击后自动拼装任务描述并交给 Agent 执行完整流程。
+     */
+    private fun quickTaskRow(): View {
+        val hasProject = selectedProject != null || state.workspace.projects().isNotEmpty()
+        val projectRef = selectedProject ?: state.workspace.projects().firstOrNull()?.name
+
+        val row = UiKit.vstack(host.context)
+        val line1 = UiKit.hstack(host.context)
+        val line2 = UiKit.hstack(host.context)
+
+        line1.addView(UiKit.ghostButton(host.context, "＋ 新建并构建") {
+            askNewProjectTask()
+        })
+        line1.addView(UiKit.spacer(host.context, 6))
+        line1.addView(UiKit.ghostButton(host.context, "▶ 构建 APK") {
+            if (!hasProject) { host.toast("请先新建或选择项目"); return@ghostButton }
+            startTask("构建当前项目${if (projectRef != null) "「$projectRef」" else ""}，如果失败请读取报错并修复后重试，成功后导出 APK 到 Downloads 目录")
+        })
+        row.addView(line1)
+        row.addView(UiKit.spacer(host.context, 6))
+
+        line2.addView(UiKit.ghostButton(host.context, "⤓ 打包源码") {
+            if (!hasProject) { host.toast("请先新建或选择项目"); return@ghostButton }
+            startTask("将当前项目${if (projectRef != null) "「$projectRef」" else ""}的源码打包为 ZIP 并导出到 Downloads 目录")
+        })
+        line2.addView(UiKit.spacer(host.context, 6))
+        line2.addView(UiKit.ghostButton(host.context, "✓ 分析并修复问题") {
+            if (!hasProject) { host.toast("请先新建或选择项目"); return@ghostButton }
+            startTask("检查当前项目${if (projectRef != null) "「$projectRef」" else ""}是否存在编译或明显代码问题，如果有请修复并重新构建验证")
+        })
+        row.addView(line2)
+        return row
+    }
+
+    /** 新建项目快捷任务：先问项目名 + 类型 + 是否顺带构建，再拼装成自然语言任务描述。 */
+    private fun askNewProjectTask() {
+        val box = UiKit.vstack(host.context).apply {
+            setPadding(UiKit.dp(host.context, 20), UiKit.dp(host.context, 10), UiKit.dp(host.context, 20), UiKit.dp(host.context, 10))
+        }
+        val nameInput = UiKit.input(host.context, "项目名称，如 CounterApp")
+        var type = "Android"
+        box.addView(UiKit.label(host.context, "项目名称", color = com.example.myempty.githubk.R.color.on_surface))
+        box.addView(UiKit.spacer(host.context, 4))
+        box.addView(nameInput)
+        box.addView(UiKit.spacer(host.context, 10))
+        box.addView(UiKit.label(host.context, "项目类型", color = com.example.myempty.githubk.R.color.on_surface))
+        box.addView(UiKit.spacer(host.context, 4))
+        val typeRow = UiKit.hstack(host.context)
+        listOf("Android", "Flutter", "空项目").forEach { t ->
+            typeRow.addView(UiKit.chip(host.context, t, type == t) { type = t })
+            typeRow.addView(UiKit.spacer(host.context, 6))
+        }
+        box.addView(typeRow)
+        box.addView(UiKit.spacer(host.context, 8))
+        box.addView(UiKit.label(host.context, "描述你想要的功能（可选），AI 会在新建后直接实现并构建：", color = com.example.myempty.githubk.R.color.muted, size = 11f))
+        box.addView(UiKit.spacer(host.context, 4))
+        val goalInput = UiKit.textArea(host.context, "例如：一个带加减按钮和计数显示的主页面")
+        box.addView(goalInput)
+
+        UiKit.dialog(host.context, "新建并构建项目", box, onOk = {
+            val name = nameInput.text.toString().trim().ifBlank { "NewProject" }
+            val goal = goalInput.text.toString().trim()
+            val task = buildString {
+                append("创建一个名为 $name 的 $type 项目")
+                if (goal.isNotBlank()) append("，实现以下功能：$goal")
+                append("。完成后构建项目，若失败请读取错误信息修复后重新构建，直到构建成功，最后导出 APK 到 Downloads 目录。")
+            }
+            startTask(task)
+        }, onCancel = {})
+    }
+
+    private fun chooseProject() {
+        val projects = state.workspace.projects()
+        if (projects.isEmpty()) { host.toast("请先在工作区新建或导入项目"); return }
+        val box = UiKit.vstack(host.context).apply {
+            setPadding(UiKit.dp(host.context, 24), UiKit.dp(host.context, 12), UiKit.dp(host.context, 24), UiKit.dp(host.context, 12))
+        }
+        projects.forEach { p ->
+            box.addView(UiKit.ghostButton(host.context, "${p.name} [${p.type}]") {
+                selectedProject = p.name
+                host.runUi { host.toast("已选择项目：${p.name}") }
+                refreshStatus()
+            })
+            box.addView(UiKit.spacer(host.context, 6))
+        }
+        UiKit.dialog(host.context, "选择目标项目", box)
+    }
+
+    private fun startTask(presetTask: String? = null) {
+        if (running) { host.toast("Agent 正在运行中"); return }
+        if (presetTask != null) taskInput.setText(presetTask)
+        val task = (presetTask ?: taskInput.text.toString()).trim()
+        if (task.isBlank()) { host.toast("请输入任务"); return }
+        val cfg0 = state.ai.config()
+        if (!cfg0.enabled) { host.toast("AI 已停用，请先到 AI 配置中心开启"); return }
+        if (cfg0.key.isBlank() && !state.ai.keyOptional(cfg0.provider)) { host.toast("请先配置 AI API Key"); return }
+        val project: Project? = selectedProject?.let { state.workspace.project(it) }
+
+        running = true
+        runBtn?.isEnabled = false
+        appendLog("开始执行任务：$task", com.example.myempty.githubk.R.color.accent)
+        appendLog("   可用工具：文件读写/构建/Git/MCP(${state.mcp.allEnabledServers().size} 服务)/Skill(${state.skill.list().size} 个)", com.example.myempty.githubk.R.color.muted)
+
+        Thread {
+            val result = state.agent.run(task, project) { line ->
+                appendLog(line, com.example.myempty.githubk.R.color.on_surface)
+            }
+            host.runUi {
+                appendLog("═══ 完成（${result.iterations} 轮，写入 ${result.filesChanged} 个文件）═══", com.example.myempty.githubk.R.color.success)
+                appendLog(result.finalMessage.take(2000), com.example.myempty.githubk.R.color.on_surface)
+                running = false
+                runBtn?.isEnabled = true
+            }
+        }.start()
+    }
+}
