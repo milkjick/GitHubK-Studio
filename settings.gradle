@@ -1,0 +1,35 @@
+pluginManagement {
+    repositories {
+        maven { url 'file:///opt/maven-repo' }
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        maven { url 'file:///opt/maven-repo' }
+        // Restrict google() to actual Google/AndroidX groups. Without this,
+        // Gradle queries dl.google.com for EVERY dependency (including
+        // io.github.* libs that were never published there), and on
+        // networks where Google's CDN is slow/unreachable a single timeout
+        // aborts the whole resolution instead of falling through to
+        // mavenCentral()/jitpack below.
+        google {
+            content {
+                includeGroupByRegex "com\\.android.*"
+                includeGroupByRegex "com\\.google.*"
+                includeGroupByRegex "androidx.*"
+            }
+        }
+        mavenCentral()
+        // Fallback for GitHub-hosted libraries (e.g. io.github.* / com.github.*
+        // artifacts) that aren't mirrored on Maven Central.
+        maven { url 'https://jitpack.io' }
+    }
+}
+
+rootProject.name = 'GitHubK Studio'
+include ':app'
