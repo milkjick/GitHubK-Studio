@@ -425,6 +425,27 @@ class GitHubApi(private val getToken: () -> String?) {
         true
     } catch (_: Throwable) { false }
 
+    /**
+     * 更新仓库状态（PATCH /repos/{owner}/{repo}）。
+     * 可修改：可见性 private、描述 description、首页 homepage、归档 archived、默认分支 default_branch
+     * 等。传入 null 表示不修改该字段。返回是否成功。
+     */
+    fun updateRepo(
+        fullName: String,
+        isPrivate: Boolean? = null,
+        description: String? = null,
+        homepage: String? = null,
+        defaultBranch: String? = null
+    ): Boolean = try {
+        val body = JSONObject()
+        if (isPrivate != null) body.put("private", isPrivate)
+        if (description != null) body.put("description", description)
+        if (homepage != null) body.put("homepage", homepage)
+        if (defaultBranch != null) body.put("default_branch", defaultBranch)
+        request("PATCH", "https://api.github.com/repos/$fullName", body.toString())
+        true
+    } catch (_: Throwable) { false }
+
     /** 从本地 ZIP 文件导入到远程仓库（解压后逐文件上传，自动替换已有文件）。 */
     fun uploadZipToRepo(
         fullName: String,
