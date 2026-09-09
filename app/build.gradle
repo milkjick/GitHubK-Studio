@@ -1,0 +1,57 @@
+apply plugin: 'com.android.application'
+apply plugin: 'org.jetbrains.kotlin.android'
+// AGP 9's built-in Kotlin support replaces the kotlin-android plugin; applying
+// both registers the 'kotlin' extension twice and fails the build.
+
+android {
+    namespace 'com.example.myempty.githubk'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.example.myempty.githubk'
+        minSdk 24
+        targetSdk 34
+        versionCode 37
+        versionName '5.0.16-full-terminal-dl'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    buildFeatures {
+        viewBinding false
+        aidl true
+    }
+
+    // native library 使用预编译 jniLibs（libgithubkpty.so），无需 ndk-build。
+    // NDK 25 的 ndk-build 无法在本机 aarch64 proot 环境运行（Unknown host CPU architecture）。
+    // 如需重新编译 C 代码，请在有 x86_64 主机或 Android Studio 的环境执行
+    //   app/src/main/cpp/Android.mk 中的构建，然后把产物放入 app/src/main/jniLibs/<abi>/。
+    // ndkVersion '25.1.8937393'
+
+
+    packagingOptions {
+        resources {
+            excludes += ['META-INF/DEPENDENCIES', 'META-INF/LICENSE*', 'META-INF/NOTICE*']
+        }
+        // 预编译 jniLibs 提供，无需 NDK llvm-strip（x86-64 二进制在 aarch64 proot 下不可用）
+        doNotStrip '**/*.so'
+    }
+
+    aaptOptions {
+        noCompress 'tar.gz', 'deb'
+    }
+}
+
+dependencies {
+    // Dhizuku is kept as the only external privilege API dependency. Shizuku
+    // itself remains on the dependency-free wire implementation so AIDE/Termux
+    // builds do not depend on the Shizuku AndroidX AAR graph.
+    implementation 'io.github.iamr0s:Dhizuku-API:2.5.4'
+}
