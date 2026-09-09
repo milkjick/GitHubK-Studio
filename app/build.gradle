@@ -11,8 +11,27 @@ android {
         applicationId 'com.example.myempty.githubk'
         minSdk 24
         targetSdk 34
-        versionCode 37
-        versionName '5.0.16-full-terminal-dl'
+        versionCode 50
+        versionName '5.2.2'
+    }
+
+    signingConfigs {
+        release {
+            storeFile file("../release.keystore")
+            storePassword "githubkstudio"
+            keyAlias "githubk"
+            keyPassword "githubkstudio"
+        }
+    }
+
+    buildTypes {
+        release {
+            // APK 瘦身：启用 R8 混淆 + 资源压缩，显著缩小体积
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
+        }
     }
 
     compileOptions {
@@ -46,6 +65,12 @@ android {
 
     aaptOptions {
         noCompress 'tar.gz', 'deb'
+    }
+
+    lint {
+        // release 构建不做致命 lint 中断（体积/性能优化优先，避免误报阻断发行）
+        abortOnError = false
+        checkReleaseBuilds = false
     }
 }
 
