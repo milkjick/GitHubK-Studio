@@ -1,0 +1,19 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+    <uses-sdk tools:overrideLibrary="com.rosan.dhizuku.api,com.rosan.dhizuku.aidl,com.rosan.dhizuku.shared" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <application android:usesCleartextTraffic="true" android:extractNativeLibs="true" android:theme="@style/AppTheme" android:label="GitHubK Studio" android:icon="@drawable/ic_launcher" android:roundIcon="@drawable/ic_launcher" android:allowBackup="false" android:supportsRtl="true">
+        <meta-data android:name="moe.shizuku.client.V3_SUPPORT" android:value="true" />
+        <activity android:name=".ui.MainActivity" android:exported="true" android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <service android:name=".ui.TermuxResultService" android:exported="false" />
+        <provider android:name=".io.LocalFileProvider" android:authorities="com.example.myempty.githubk.files" android:exported="false" android:grantUriPermissions="true" />
+        <provider android:name=".shizuku.ShizukuProvider" android:authorities="com.example.myempty.githubk.shizuku" android:exported="true" android:multiprocess="false" android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+        <service android:name=".terminal.ShizukuUserService" android:exported="true" android:permission="android.permission.BIND_JOB_SERVICE" />
+    </application>
+</manifest>
