@@ -1,0 +1,673 @@
+package com.example.myempty.githubk.terminal
+
+import android.content.Context
+import android.os.Build
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.MessageDigest
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipFile
+import java.util.zip.GZIPInputStream
+import java.io.BufferedInputStream
+
+/**
+ * Online toolchain provisioner.
+ *
+ * The design deliberately follows the Termux/ZeroTermux model: the app owns a
+ * private POSIX prefix and uses its package manager for native aarch64 tools,
+ * while large SDK archives are installed into a deterministic user-owned tree.
+ * No root is required.
+ */
+class ToolchainDownloadManager(
+    private val context: Context,
+    private val runtime: BuiltinRuntime
+) {
+    private val prefs = context.getSharedPreferences("githubk", Context.MODE_PRIVATE)
+    private val sdkRoot get() = File(runtime.home, "android-sdk")
+    private val toolRoot get() = File(runtime.home, "toolchains")
+    private val downloadRoot get() = File(context.cacheDir, "toolchain-downloads")
+
+    companion object {
+        private const val ANDROID_CLI_URL =
+            "https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip"
+        private const val ANDROID_CLI_SHA256 =
+            "4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583"
+        private const val GRADLE_VERSION = "9.3.1"
+        private const val FLUTTER_RELEASES =
+            "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json"
+        private const val DART_LATEST =
+            "https://storage.googleapis.com/dart-archive/channels/stable/release/latest/VERSION"
+        private const val FLUTTER_TERMUX_ARM64_URL =
+            "https://github.com/ImL1s/termux-flutter-wsl/releases/download/v3.44.9-termux/flutter_3.44.9_aarch64.deb"
+        private const val FLUTTER_TERMUX_ARM64_SHA256 =
+            "8b32041a11452b8d995ba45dcc2bb196e4d841410c46871853a6f4c24acddd20"
+    }
+
+    fun installCompleteIdeEnvironment(onOutput: (String) -> Unit = {}): Boolean {
+        val failures = mutableListOf<String>()
+
+        // ---- [1/7] Termux runtime ----
+        onOutput("[1/7] 安装/校验内置 Termux runtime（GitHub 直连 + 多个加速镜像 + SHA-256 校验）…\n")
+        if (!runtime.isInstalled()) {
+            try {
+                runtime.install { p -> onOutput("[RUNTIME] ${(p * 100).toInt()}%\n") }
+            } catch (e: Throwable) {
+                onOutput("[错误] runtime 安装失败：${e.message ?: e.javaClass.simpleName}\n")
+                onOutput("下载候选均已尝试；请检查网络后重试本操作。\n")
+                return false
+            }
+        }
+        if (!runtime.isInstalled()) {
+            onOutput("[错误] runtime bash 校验失败；请重试安装。\n")
+            return false
+        }
+        onOutput("[1/7] runtime 就绪 ✓\n")
+
+        // ---- [2/7] native packages ----
+        onOutput("[2/7] 安装 ARM64 原生开发工具（openjdk-17/21 · git · gradle · clang · cmake …）…\n")
+        val nativePackages = listOf(
+            "openjdk-17", "openjdk-21", "git", "gradle", "python", "nodejs", "clang", "cmake",
+            "ninja", "make", "pkg-config", "zip", "unzip", "tar", "xz-utils",
+            "curl", "wget", "android-tools", "aapt2", "openssl-tool", "which", "findutils"
+        )
+        val nativeOk = try {
+            runtime.installPackages(nativePackages, onOutput)
+        } catch (e: Throwable) {
+            onOutput("[错误] ${e.message ?: e.javaClass.simpleName}\n"); false
+        }
+        if (nativeOk) {
+            onOutput("[2/7] 原生开发工具安装完成 ✓\n")
+        } else {
+            failures += "Termux 原生开发工具（openjdk/gradle/git/clang 等）"
+            onOutput("[WARN] 部分原生包安装失败（已逐个尝试软件源镜像）。\n")
+            onOutput("      后续步骤会继续执行；网络恢复后可重新点本按钮补装。\n")
+        }
+
+        // ---- [3/7] cmdline tools ----
+        // 若 SDK 组件已存在（离线导入或历史安装），跳过整个在线 SDK 流程。
+        val sdkAlready = listOf(34, 35, 36).any { api ->
+            File(sdkRoot, "platforms/android-$api/android.jar").exists()
+        } && File(sdkRoot, "build-tools").isDirectory
+        var cliOk: Boolean
+        if (sdkAlready) {
+            onOutput("[3/7] 检测到 Android SDK 平台/Build-Tools 已存在，跳过在线下载 ✓\n")
+            cliOk = true
+        } else {
+            onOutput("[3/7] Android SDK Command-line Tools…\n")
+            cliOk = try {
+                installAndroidCommandLineTools(onOutput)
+            } catch (e: Throwable) {
+                onOutput("[错误] ${e.message ?: e.javaClass.simpleName}\n"); false
+            }
+            if (!cliOk) onOutput("[提示] 未能联网下载 SDK Command-line Tools；可稍后：①联网补装，或 ②导入离线 Android SDK 目录（含 platforms/build-tools）。\n")
+        }
+
+        // ---- [4/7] sdk platforms ----
+        var sdkOk = false
+        if (sdkAlready) {
+            onOutput("[4/7] SDK 平台组件已就绪 ✓\n")
+            sdkOk = true
+        } else if (cliOk) {
+            onOutput("[4/7] Android SDK 平台 / Build Tools（API 34/35/36）…\n")
+            sdkOk = try {
+                installSdkPackages(onOutput)
+            } catch (e: Throwable) {
+                onOutput("[错误] ${e.message ?: e.javaClass.simpleName}\n"); false
+            }
+            if (sdkOk) {
+                onOutput("[4/7] SDK 平台组件就绪 ✓\n")
+            } else {
+                onOutput("[WARN] SDK 平台组件未完成；可稍后单独点“只安装 Android 编译环境”或离线导入 SDK 目录。\n")
+            }
+        } else {
+            onOutput("[4/7] 跳过 SDK 平台组件（Command-line Tools 不可用/无网络）。核心 Termux 工具链已离线安装。\n")
+        }
+
+        // ---- [5/7] arm64 fix ----
+        onOutput("[5/7] 修复 ARM64 aapt2 / adb…\n")
+        try {
+            configureArm64Aapt2(onOutput)
+            linkTermuxAdb(onOutput)
+        } catch (e: Throwable) {
+            onOutput("[WARN] ARM64 修复未完全执行：${e.message ?: e.javaClass.simpleName}\n")
+        }
+
+        // ---- [6/7] flutter/dart (optional) ----
+        onOutput("[6/7] Flutter + Dart（可选组件；失败不影响 Android 编译）…\n")
+        val flutterOk = try {
+            installFlutterAndDart(onOutput)
+        } catch (e: Throwable) {
+            onOutput("[错误] ${e.message ?: e.javaClass.simpleName}\n"); false
+        }
+        if (flutterOk) onOutput("[6/7] Flutter/Dart 就绪 ✓\n")
+        else onOutput("[6/7] Flutter/Dart 未就绪；可稍后在本页单独点“安装 Flutter + Dart”。\n")
+
+        // ---- [7/7] env ----
+        onOutput("[7/7] 写入统一环境变量与 Gradle 配置…\n")
+        try { writeEnvironmentFiles(onOutput) } catch (e: Throwable) {
+            onOutput("[WARN] 环境文件写入异常：${e.message ?: e.javaClass.simpleName}\n")
+        }
+
+        onOutput("\n===== 安装报告 =====\n")
+        if (failures.isEmpty()) {
+            onOutput("✓ 完整 IDE 环境已就绪：Termux runtime + JDK/Gradle/Git + ARM64 aapt2/adb + Flutter/Dart\n")
+            if (!sdkAlready && !sdkOk) {
+                onOutput("ℹ Android SDK 平台组件未安装（当前无网络或未导入）。核心工具链已完全离线可用；\n")
+                onOutput("  需要编译 Android 项目时：联网点“SDK 组件检测/安装”，或在设置中导入含 platforms/build-tools 的离线 SDK 目录。\n")
+            }
+        } else {
+            onOutput("以下组件未成功，可分别单独重试：\n")
+            failures.forEach { onOutput("  ✗ $it\n") }
+            onOutput("SDK 目录：${sdkRoot.absolutePath}\n")
+            onOutput("提示：Termux 工具链已内置离线安装；若仅缺 Android SDK 平台组件，可联网补装或离线导入 SDK 目录。\n")
+        }
+        return failures.isEmpty()
+    }
+
+    fun installAndroidCommandLineTools(onOutput: (String) -> Unit = {}): Boolean {
+        sdkRoot.mkdirs()
+        val existing = File(sdkRoot, "cmdline-tools/latest/bin/sdkmanager")
+        if (existing.exists()) {
+            onOutput("[SDK] Command-line Tools 已存在，跳过下载。\n")
+            return true
+        }
+        downloadRoot.mkdirs()
+        val archive = File(downloadRoot, "commandlinetools-linux-latest.zip")
+        if (!downloadResumable(ANDROID_CLI_URL, archive, ANDROID_CLI_SHA256, onOutput)) {
+            onOutput("[SDK] Command-line Tools 下载失败。请确认网络能访问 dl.google.com 后重试。\n")
+            return false
+        }
+
+        val staging = File(context.cacheDir, "cmdline-tools-staging").apply {
+            deleteRecursively(); mkdirs()
+        }
+        extractZip(archive, staging, onOutput)
+        val source = listOf(File(staging, "cmdline-tools"), staging)
+            .firstOrNull { File(it, "bin/sdkmanager").exists() }
+            ?: run {
+                onOutput("[SDK] 下载包中未找到 sdkmanager，请重试。\n")
+                return false
+            }
+        val latest = File(sdkRoot, "cmdline-tools/latest")
+        latest.deleteRecursively(); latest.mkdirs()
+        source.copyRecursively(latest, overwrite = true)
+        latest.walkTopDown().forEach { if (it.isFile) it.setReadable(true, false) }
+        File(latest, "bin").listFiles()?.forEach { it.setExecutable(true, false) }
+        prefs.edit().putString("sdk_home", sdkRoot.absolutePath).apply()
+        onOutput("[SDK] Command-line Tools 已安装。\n")
+        return File(latest, "bin/sdkmanager").exists()
+    }
+
+    fun installFlutterAndDart(onOutput: (String) -> Unit = {}): Boolean {
+        if (!runtime.isInstalled()) runtime.install { p -> onOutput("[RUNTIME] ${(p * 100).toInt()}%\n") }
+        if (!runtime.isInstalled()) return false
+        // 已通过 assets 离线包安装则直接返回（避免离线时重复下载失败）
+        val flutterBinPrefix = File(runtime.prefix, "bin/flutter")
+        val dartBinPrefix = File(runtime.prefix, "bin/dart")
+        if (flutterBinPrefix.exists() && dartBinPrefix.exists()) {
+            prefs.edit()
+                .putString("flutter_home", runtime.prefix)
+                .putString("flutter_bin", flutterBinPrefix.absolutePath)
+                .putString("dart_home", runtime.prefix)
+                .apply()
+            onOutput("[FLUTTER] 检测到内置离线 Flutter/Dart（${runtime.prefix}），跳过下载。\n")
+            return true
+        }
+        // Flutter archive extraction needs tar/xz. These are native Termux packages.
+        runtime.installPackages(listOf("tar", "xz-utils", "curl", "unzip"), onOutput)
+
+        val arch = when {
+            Build.SUPPORTED_ABIS.any { it == "arm64-v8a" } -> "arm64"
+            Build.SUPPORTED_ABIS.any { it == "x86_64" } -> "x64"
+            Build.SUPPORTED_ABIS.any { it == "armeabi-v7a" } -> "arm"
+            else -> return false.also { onOutput("[FLUTTER] 不支持的 Android ABI。\n") }
+        }
+
+        // ARM64 Android/Termux cannot execute the official Linux Flutter host SDK,
+        // which targets glibc. Use the maintained Termux ARM64 Flutter package instead.
+        if (arch == "arm64") {
+            return installTermuxArm64Flutter(onOutput)
+        }
+        val flutterArchive = resolveFlutterArchive(arch, onOutput)
+        if (flutterArchive == null) {
+            val dartOk = installStandaloneDart(arch, onOutput)
+            onOutput("[FLUTTER] 没有匹配的官方 host SDK。\n")
+            return dartOk
+        }
+        val archiveName = flutterArchive.substringAfterLast('/')
+        val flutterFile = File(downloadRoot, archiveName.ifBlank { "flutter-host.tar.xz" })
+        downloadRoot.mkdirs()
+        val flutterUrl = flutterArchiveUrl(flutterArchive)
+        if (!downloadResumable(flutterUrl, flutterFile, null, onOutput)) return false
+
+        val flutterDest = File(runtime.home, "flutter-sdk")
+        if (!extractFlutter(flutterFile, flutterDest, onOutput)) return false
+        val flutterBin = File(flutterDest, "bin/flutter")
+        if (!flutterBin.exists()) return false
+        flutterBin.setExecutable(true, false)
+        prefs.edit()
+            .putString("flutter_home", flutterDest.absolutePath)
+            .putString("flutter_bin", flutterBin.absolutePath)
+            .apply()
+
+        // Flutter bundles the exact Dart version it requires. Keep it as the primary Dart SDK.
+        val bundledDart = File(flutterDest, "bin/cache/dart-sdk")
+        if (File(bundledDart, "bin/dart").exists()) {
+            prefs.edit().putString("dart_home", bundledDart.absolutePath).apply()
+            onOutput("[DART] 使用 Flutter 配套 Dart SDK：${bundledDart.absolutePath}\n")
+        } else {
+            installStandaloneDart(arch, onOutput)
+        }
+
+        // Pre-download Flutter artifacts so the first `flutter build` is not a surprise.
+        val env = "export HOME='${runtime.home.absolutePath}'; export PUB_CACHE='${File(runtime.home, ".pub-cache").absolutePath}'; " +
+            "export PATH='${flutterDest.resolve("bin").absolutePath}:${runtime.prefix}/bin:/system/bin'; "
+        val result = runtime.run("${env}${quote(flutterBin.absolutePath)} config --no-analytics >/dev/null 2>&1; " +
+            "${quote(flutterBin.absolutePath)} doctor -v 2>&1 | tail -80")
+        if (result.isNotBlank()) onOutput(result + "\n")
+        onOutput("[FLUTTER] Flutter SDK 已安装：${flutterDest.absolutePath}\n")
+        return File(flutterDest, "bin/flutter").exists() && prefs.getString("dart_home", null) != null
+    }
+
+    private fun installTermuxArm64Flutter(onOutput: (String) -> Unit): Boolean {
+        downloadRoot.mkdirs()
+        val deb = File(downloadRoot, "flutter_3.44.9_aarch64.deb")
+        onOutput("[FLUTTER] ARM64 Termux Flutter 3.44.9，约 170MB，开始下载…\n")
+        if (!downloadResumable(FLUTTER_TERMUX_ARM64_URL, deb, FLUTTER_TERMUX_ARM64_SHA256, onOutput)) return false
+        val prefix = runtime.prefix
+        val cmd = "export PREFIX='${prefix}'; export TERMUX_PREFIX='${prefix}'; export HOME='${runtime.home.absolutePath}'; " +
+            "export PATH='${prefix}/bin:/system/bin:/system/xbin'; " +
+            "dpkg -i '${deb.absolutePath}' || apt --fix-broken install -y; " +
+            "if [ -f '${prefix}/share/flutter/post_install.sh' ]; then bash '${prefix}/share/flutter/post_install.sh' || true; fi; " +
+            "command -v flutter && flutter --version 2>&1 | head -20"
+        val result = runtime.run(cmd)
+        if (result.isNotBlank()) onOutput(result + "\n")
+        val flutter = File(prefix, "bin/flutter")
+        if (!flutter.exists()) {
+            onOutput("[FLUTTER] ARM64 Flutter 安装后未找到 ${flutter.absolutePath}。\n")
+            return false
+        }
+        flutter.setExecutable(true, false)
+        prefs.edit().putString("flutter_home", prefix).putString("flutter_bin", flutter.absolutePath).apply()
+        val dart = File(prefix, "bin/dart")
+        if (dart.exists()) prefs.edit().putString("dart_home", prefix).apply()
+        onOutput("[FLUTTER] ARM64 Flutter 3.44.9 安装完成。\n")
+        return true
+    }
+
+    private fun installStandaloneDart(arch: String, onOutput: (String) -> Unit): Boolean {
+        val version = httpText(DART_LATEST).let { JSONObject(it).optString("version") }
+        if (version.isBlank()) return false
+        val url = "https://storage.googleapis.com/dart-archive/channels/stable/release/$version/sdk/dartsdk-linux-$arch-release.zip"
+        val archive = File(downloadRoot, "dartsdk-linux-$arch-$version.zip")
+        if (!downloadResumable(url, archive, null, onOutput)) return false
+        val staging = File(context.cacheDir, "dart-staging").apply { deleteRecursively(); mkdirs() }
+        extractZip(archive, staging, onOutput)
+        val source = File(staging, "dart-sdk")
+        val dest = File(runtime.home, "dart-sdk")
+        if (!File(source, "bin/dart").exists()) return false
+        dest.deleteRecursively(); source.copyRecursively(dest, overwrite = true)
+        dest.resolve("bin").listFiles()?.forEach { it.setExecutable(true, false) }
+        prefs.edit().putString("dart_home", dest.absolutePath).apply()
+        onOutput("[DART] 独立 Dart SDK $version 已安装。\n")
+        return true
+    }
+
+    /**
+     * Experimental ARM64 Flutter fallback. It discovers a release asset instead of
+     * hard-coding a third-party filename. If the upstream project does not publish an
+     * ARM64 archive, the installer simply leaves Flutter uninstalled rather than
+     * placing an x86_64 binary on an ARM64 phone.
+     */
+    private fun resolveExperimentalArm64Flutter(onOutput: (String) -> Unit): String? {
+        val api = "https://api.github.com/repos/ImL1s/termux-flutter-wsl/releases/latest"
+        return runCatching {
+            val root = JSONObject(httpText(api))
+            val assets = root.optJSONArray("assets") ?: return@runCatching null
+            for (i in 0 until assets.length()) {
+                val a = assets.optJSONObject(i) ?: continue
+                val name = a.optString("name").lowercase()
+                val url = a.optString("browser_download_url")
+                if (name.contains("flutter") && name.contains("arm64") &&
+                    (name.endsWith(".tar.xz") || name.endsWith(".tar.gz") || name.endsWith(".zip")) && url.isNotBlank()) {
+                    onOutput("[FLUTTER] 使用实验性 ARM64 Flutter 构建：$name\n")
+                    return@runCatching url
+                }
+            }
+            null
+        }.onFailure { onOutput("[FLUTTER] ARM64 fallback 查询失败：${it.message}\n") }.getOrNull()
+    }
+
+    private fun resolveFlutterArchive(arch: String, onOutput: (String) -> Unit): String? {
+        return runCatching {
+            val json = JSONObject(httpText(FLUTTER_RELEASES))
+            val hash = json.getJSONObject("current_release").optString("stable")
+            val releases = json.getJSONArray("releases")
+            var archive = ""
+            for (i in 0 until releases.length()) {
+                val r = releases.getJSONObject(i)
+                if (r.optString("hash") == hash && r.optString("channel") == "stable") {
+                    val a = r.optString("archive")
+                    // Official Linux Flutter archives are currently x64-only.
+                    // Do not accidentally install an x86_64 SDK on an ARM64 phone.
+                    val declaredArch = r.optString("dart_sdk_arch", "x64")
+                    if (arch == "x64" && declaredArch == "x64") archive = a
+                    break
+                }
+            }
+            if (archive.isBlank() && arch == "x64") {
+                for (i in 0 until releases.length()) {
+                    val r = releases.getJSONObject(i)
+                    val a = r.optString("archive")
+                    if (r.optString("channel") == "stable" && a.contains("linux/flutter_linux_")) {
+                        archive = a; break
+                    }
+                }
+            }
+            if (archive.isBlank()) {
+                onOutput("[FLUTTER] 官方 Linux stable 当前没有 ARM64 Flutter host SDK；为避免在 ARM64 手机上下载 x86_64 SDK，已停止自动安装。Dart ARM64 仍可独立安装。\n")
+                null
+            } else archive
+        }.onFailure { onOutput("[FLUTTER] release manifest 读取失败：${it.message}\n") }.getOrNull()
+    }
+
+    private fun flutterArchiveUrl(path: String): String =
+        if (path.startsWith("http")) path
+        else "https://storage.googleapis.com/flutter_infra_release/releases/$path"
+
+    private fun extractFlutter(archive: File, dest: File, onOutput: (String) -> Unit): Boolean {
+        val staging = File(context.cacheDir, "flutter-staging").apply { deleteRecursively(); mkdirs() }
+        // tar/xz are supplied by the Termux runtime, so this stays native and low-memory.
+        val command = "mkdir -p ${quote(staging.absolutePath)} && tar -xJf ${quote(archive.absolutePath)} -C ${quote(staging.absolutePath)}"
+        val result = runtime.run(command)
+        if (result.isNotBlank()) onOutput(result + "\n")
+        val source = listOf(File(staging, "flutter"), staging).firstOrNull { File(it, "bin/flutter").exists() }
+            ?: return false
+        dest.deleteRecursively(); dest.parentFile?.mkdirs(); source.copyRecursively(dest, overwrite = true)
+        dest.resolve("bin").listFiles()?.forEach { it.setExecutable(true, false) }
+        return true
+    }
+
+    private fun installSdkPackages(onOutput: (String) -> Unit): Boolean {
+        val sdkmanager = File(sdkRoot, "cmdline-tools/latest/bin/sdkmanager")
+        if (!sdkmanager.exists()) return false
+        val java17 = File(runtime.prefix, "lib/jvm/java-17-openjdk")
+        val javaHome = if (File(java17, "bin/java").exists()) java17 else File(runtime.prefix, "lib/jvm/java-17-openjdk")
+        val env = "export JAVA_HOME='${javaHome.absolutePath}'; export ANDROID_HOME='${sdkRoot.absolutePath}'; export ANDROID_SDK_ROOT='${sdkRoot.absolutePath}'; export PATH='${javaHome.resolve("bin").absolutePath}:${runtime.prefix}/bin:/system/bin'; "
+        // API 36 is the latest stable platform documented by Android Developers in 2026.
+        val packages = listOf(
+            "platforms;android-36",
+            "build-tools;36.0.0",
+            "platforms;android-35",
+            "build-tools;35.0.0",
+            "platforms;android-34",
+            "build-tools;34.0.0"
+        )
+        val command = env + "yes | ${quote(sdkmanager.absolutePath)} --licenses >/dev/null 2>&1 || true; " +
+            packages.joinToString(" ") { quote(it) }.let { "${quote(sdkmanager.absolutePath)} $it --sdk_root=${quote(sdkRoot.absolutePath)}" }
+        // 注意：平台包下载可能达数百 MB，必须“等待命令真正退出”再校验，
+        // 不能用短超时的 runtime.run()（30 秒会截断下载导致误报失败）。
+        val sdkOk = runToolchainCommand(command, onOutput, "SDK")
+        // Platform-tools from Google are x86_64 on Linux; Termux android-tools is ARM64.
+        linkTermuxAdb(onOutput)
+        return sdkOk && File(sdkRoot, "platforms/android-36/android.jar").exists()
+    }
+
+    private fun linkTermuxAdb(onOutput: (String) -> Unit) {
+        val dir = File(sdkRoot, "platform-tools").apply { mkdirs() }
+        val adb = File(runtime.prefix, "bin/adb")
+        if (adb.exists()) {
+            val target = File(dir, "adb")
+            target.delete()
+            runCatching { target.parentFile?.mkdirs(); java.nio.file.Files.createSymbolicLink(target.toPath(), adb.toPath()) }
+                .onFailure { adb.copyTo(target, overwrite = true); target.setExecutable(true, false) }
+            onOutput("[ADB] 使用 Termux ARM64 android-tools。\n")
+        }
+    }
+
+    private fun configureArm64Aapt2(onOutput: (String) -> Unit) {
+        val source = File(runtime.prefix, "bin/aapt2")
+        if (!source.exists()) {
+            onOutput("[ARM64] aapt2 未安装；后续 ARM64 构建可能失败。\n")
+            return
+        }
+        val versions = sdkRoot.resolve("build-tools").listFiles()?.filter { it.isDirectory } ?: emptyList()
+        versions.forEach { dir ->
+            val aapt2 = File(dir, "aapt2")
+            if (aapt2.exists()) aapt2.delete()
+            runCatching { java.nio.file.Files.createSymbolicLink(aapt2.toPath(), source.toPath()) }
+                .onFailure { source.copyTo(aapt2, overwrite = true); aapt2.setExecutable(true, false) }
+        }
+        val gradleHome = File(runtime.home, "gradle-home").apply { mkdirs() }
+        val props = File(gradleHome, "gradle.properties")
+        val old = if (props.exists()) props.readLines().filterNot { it.startsWith("android.aapt2FromMavenOverride=") } else emptyList()
+        props.writeText((old + "android.aapt2FromMavenOverride=${source.absolutePath}").joinToString("\n") + "\n")
+        onOutput("[ARM64] aapt2 override 已配置：${source.absolutePath}\n")
+    }
+
+    private fun writeEnvironmentFiles(onOutput: (String) -> Unit) {
+        val envFile = File(runtime.home, ".githubk-env").apply { parentFile?.mkdirs() }
+        envFile.writeText("""
+export PREFIX='${runtime.prefix}'
+export HOME='${runtime.home.absolutePath}'
+export ANDROID_HOME='${sdkRoot.absolutePath}'
+export ANDROID_SDK_ROOT='${sdkRoot.absolutePath}'
+export JAVA_HOME='${runtime.prefix}/lib/jvm/java-17-openjdk'
+export FLUTTER_JAVA_HOME='${runtime.prefix}/lib/jvm/java-21-openjdk'
+export FLUTTER_HOME='${prefs.getString("flutter_home", "") ?: ""}'
+export DART_HOME='${prefs.getString("dart_home", "") ?: ""}'
+export PATH="${runtime.prefix}/bin:${sdkRoot}/cmdline-tools/latest/bin:${sdkRoot}/platform-tools:${prefs.getString("flutter_home", "") ?: ""}/bin:${prefs.getString("dart_home", "") ?: ""}/bin:${'$'}JAVA_HOME/bin:${'$'}PATH"
+export GRADLE_USER_HOME='${runtime.home.absolutePath}/gradle-home'
+""".trimIndent() + "\n")
+        onOutput("[ENV] ${envFile.absolutePath}\n")
+    }
+
+    /**
+     * 下载大文件时不再盲目续传：Android/运营商代理有时会忽略 Range，
+     * 把一段错误响应追加到旧文件，最终出现 GZIP ID1ID2 / ZIP magic 错误。
+     * 这里使用 .part 临时文件、Accept-Encoding: identity、Range 严格校验，
+     * 并在 SHA/ZIP 校验失败时自动从零重试一次。
+     */
+    private fun downloadResumable(url: String, dest: File, sha256: String?, onOutput: (String) -> Unit): Boolean {
+        dest.parentFile?.mkdirs()
+        val part = File(dest.parentFile, dest.name + ".part")
+        part.delete()
+
+        fun attempt(attemptNo: Int): Boolean {
+            val started = android.os.SystemClock.elapsedRealtime()
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.instanceFollowRedirects = true
+            conn.connectTimeout = 30000
+            conn.readTimeout = 180000
+            conn.useCaches = false
+            conn.doInput = true
+            conn.setRequestProperty("User-Agent", "GitHubK-Studio/5.0.5")
+            conn.setRequestProperty("Accept", "application/zip,application/octet-stream,*/*")
+            // 禁止代理把 ZIP 当成 gzip 传输；若代理仍返回 gzip，下面会自动解压传输层 gzip。
+            conn.setRequestProperty("Accept-Encoding", "identity")
+            conn.setRequestProperty("Connection", "close")
+            return try {
+                val code = conn.responseCode
+                val contentType = conn.contentType ?: ""
+                val contentEncoding = conn.contentEncoding ?: ""
+                val total = conn.contentLengthLong
+                onOutput("[DOWNLOAD] attempt=$attemptNo HTTP=$code type=$contentType encoding=${contentEncoding.ifBlank { "identity" }} size=${if (total >= 0) total else "unknown"}\n")
+                if (code !in 200..299) {
+                    val errorText = runCatching { conn.errorStream?.bufferedReader()?.readText()?.take(600) }.getOrNull()
+                    if (!errorText.isNullOrBlank()) onOutput("[DOWNLOAD] server=${errorText.replace("\\n", " ")}\n")
+                    false
+                } else {
+                    BufferedInputStream(conn.inputStream, 256 * 1024).use { raw ->
+                        raw.mark(8)
+                        val h = ByteArray(4)
+                        val n = raw.read(h)
+                        raw.reset()
+                        val b0 = if (n > 0) h[0].toInt() and 0xff else -1
+                        val b1 = if (n > 1) h[1].toInt() and 0xff else -1
+                        val magic = if (n > 0) h.take(n).joinToString(" ") { "%02x".format(it) } else "<empty>"
+                        onOutput("[DOWNLOAD] magic=$magic\n")
+                        val input: java.io.InputStream = if (b0 == 0x1f && b1 == 0x8b) {
+                            onOutput("[DOWNLOAD] 检测到 gzip 传输层，正在解压后再校验 ZIP…\n")
+                            GZIPInputStream(raw, 256 * 1024)
+                        } else raw
+                        input.use { decoded ->
+                            FileOutputStream(part, false).use { out ->
+                                val buf = ByteArray(256 * 1024)
+                                var done = 0L
+                                var lastPct = -1
+                                var lastReportBytes = 0L
+                                while (true) {
+                                    val read = decoded.read(buf)
+                                    if (read < 0) break
+                                    if (read == 0) continue
+                                    out.write(buf, 0, read)
+                                    done += read
+                                    val pct = if (total > 0) (done * 100 / total).toInt().coerceAtMost(100) else -1
+                                    if ((pct >= 0 && pct != lastPct && (pct % 2 == 0 || pct == 100)) || done - lastReportBytes >= 1024L * 1024L) {
+                                        val sec = ((android.os.SystemClock.elapsedRealtime() - started).coerceAtLeast(1L)) / 1000.0
+                                        val speed = done / 1024.0 / 1024.0 / sec
+                                        val suffix = if (pct >= 0) "$pct%" else "${done / (1024 * 1024)}MB"
+                                        onOutput("[DOWNLOAD] $suffix · ${"%.2f".format(speed)} MB/s · ${done / (1024 * 1024)} MB\n")
+                                        lastPct = pct
+                                        lastReportBytes = done
+                                    }
+                                }
+                                out.flush()
+                                onOutput("[DOWNLOAD] 接收完成：${done / (1024 * 1024)} MB\n")
+                            }
+                        }
+                    }
+                    if (!part.exists() || part.length() < 1024L) {
+                        onOutput("[DOWNLOAD] 响应文件过小，拒绝安装：${part.length()} bytes\n")
+                        false
+                    } else if (sha256 != null && sha256.isNotBlank()) {
+                        val actual = sha256(part)
+                        onOutput("[DOWNLOAD] SHA-256=${actual}\n")
+                        if (!actual.equals(sha256, true)) {
+                            onOutput("[DOWNLOAD] SHA-256 校验失败，expected=$sha256\n")
+                            false
+                        } else true
+                    } else true
+                }
+            } catch (t: Throwable) {
+                onOutput("[DOWNLOAD] ${t.javaClass.simpleName}: ${t.message ?: "unknown error"}\n")
+                false
+            } finally { conn.disconnect() }
+        }
+
+        var ok = attempt(1)
+        if (!ok) {
+            part.delete()
+            onOutput("[DOWNLOAD] 第一次下载/校验失败，清除缓存后重新下载…\n")
+            ok = attempt(2)
+        }
+        if (!ok) {
+            part.delete()
+            dest.delete()
+            onOutput("[DOWNLOAD] 最终失败：$url\n")
+            return false
+        }
+
+        if (dest.name.endsWith(".zip")) {
+            try {
+                part.inputStream().use { input ->
+                    val magic = ByteArray(4)
+                    val n = input.read(magic)
+                    if (n != 4 || magic[0] != 0x50.toByte() || magic[1] != 0x4b.toByte()) {
+                        onOutput("[DOWNLOAD] ZIP 文件头错误：${magic.take(n.coerceAtLeast(0)).joinToString(" ") { "%02x".format(it) }}\n")
+                        part.delete(); return false
+                    }
+                }
+                ZipFile(part).use { z ->
+                    val count = z.size()
+                    if (count <= 0) throw java.io.IOException("ZIP 没有条目")
+                    z.entries().asSequence().firstOrNull()
+                    onOutput("[DOWNLOAD] ZIP 校验通过：$count entries\n")
+                }
+            } catch (e: Throwable) {
+                onOutput("[DOWNLOAD] ZIP 完整性检查失败：${e.javaClass.simpleName}: ${e.message}\n")
+                part.delete(); return false
+            }
+        }
+        if (dest.exists()) dest.delete()
+        if (!part.renameTo(dest)) {
+            part.copyTo(dest, overwrite = true)
+            part.delete()
+        }
+        onOutput("[DOWNLOAD] 已保存：${dest.absolutePath}\n")
+        return dest.exists() && dest.length() > 0
+    }
+
+    private fun extractZip(zip: File, dest: File, onOutput: (String) -> Unit) {
+        ZipInputStream(zip.inputStream().buffered()).use { zis ->
+            while (true) {
+                val e = zis.nextEntry ?: break
+                val safe = File(dest, e.name).canonicalFile
+                require(safe.path == dest.canonicalPath || safe.path.startsWith(dest.canonicalPath + File.separator))
+                if (e.isDirectory) safe.mkdirs() else {
+                    safe.parentFile?.mkdirs()
+                    FileOutputStream(safe).use { out -> zis.copyTo(out) }
+                    safe.setReadable(true, false)
+                    if (e.name.startsWith("bin/")) safe.setExecutable(true, false)
+                }
+            }
+        }
+        onOutput("[EXTRACT] ${zip.name}\n")
+    }
+
+    private fun httpText(url: String): String {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.connectTimeout = 20000; c.readTimeout = 30000
+        c.setRequestProperty("User-Agent", "GitHubK-Studio/5.0")
+        return try { c.inputStream.bufferedReader().use { it.readText() } } finally { c.disconnect() }
+    }
+
+    private fun sha256(file: File): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buf = ByteArray(1024 * 128)
+            while (true) { val n = input.read(buf); if (n < 0) break; md.update(buf, 0, n) }
+        }
+        return md.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun quote(s: String): String = "'" + s.replace("'", "'\\\"'\\\"'") + "'"
+    /**
+     * 长任务执行（sdkmanager 下载平台包等）：实时回传输出并等待命令真正退出。
+     * Shizuku 不可用时回退到 /system/bin/sh；最长等待 30 分钟。
+     */
+    private fun runToolchainCommand(command: String, onOutput: (String) -> Unit, tag: String): Boolean {
+        return try {
+            if (ShizukuShell.isServiceAvailable() && ShizukuShell.hasPermission()) {
+                onOutput("[$tag] Shizuku UserService → run-as 执行中…\n")
+                val result = ShizukuShell.execUserService(context, command, runtime.env(), runtime.home.absolutePath, 30 * 60)
+                if (result != null) {
+                    result.lineSequence().forEach { onOutput(it + "\n") }
+                    val code = Regex("\\[exit=(\\d+)\\]").find(result)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    return code == null || code == 0
+                }
+            }
+            val pb = ProcessBuilder("/system/bin/sh", "-c", command)
+            pb.environment().putAll(runtime.env())
+            pb.environment()["SHELL"] = File(runtime.home, "bin/bash").absolutePath
+            pb.redirectErrorStream(true)
+            val p = pb.start()
+            p.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines -> lines.forEach { onOutput(it + "\n") } }
+            val finished = p.waitFor(30, java.util.concurrent.TimeUnit.MINUTES)
+            if (!finished) {
+                onOutput("[$tag] 执行超过 30 分钟，已终止。\n")
+                runCatching { p.destroy() }
+                return false
+            }
+            p.exitValue() == 0
+        } catch (e: Throwable) {
+            onOutput("[$tag] 执行异常：${e.message ?: e.javaClass.simpleName}\n")
+            false
+        }
+    }
+
+
+}
