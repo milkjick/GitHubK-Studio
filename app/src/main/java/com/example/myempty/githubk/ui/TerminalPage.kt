@@ -1,0 +1,854 @@
+package com.example.myempty.githubk.ui
+
+import android.app.AlertDialog
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
+import android.view.Gravity
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.widget.EditText
+import android.widget.HorizontalScrollView
+import android.widget.LinearLayout
+import android.widget.PopupWindow
+import android.widget.TextView
+import android.text.InputType
+import com.example.myempty.githubk.terminal.LinuxSandbox
+import com.example.myempty.githubk.terminal.TermuxSandbox
+import com.example.myempty.githubk.ui.terminal.NativeTerminalView
+import java.io.File
+
+/**
+ * GitHubK Studio Terminal — Full Termux/ZeroTermux style.
+ *
+ * Keyboard fix: NativeTerminalView requests focus + shows IME on touch.
+ * Drawer: all functions execute directly inside the terminal session via
+ * terminal.writeText(). Categories cover session / environment / network /
+ * files / system / git / containers / security / dev / shell config / quick.
+ */
+class TerminalPage(
+    private val host: PageHost,
+    private val cwd: File? = null,
+    private val initialCommand: String? = null
+) {
+    private lateinit var terminal: NativeTerminalView
+    private lateinit var status: TextView
+    private lateinit var sessionTitle: TextView
+    private var root: LinearLayout? = null
+    private var rootFrame: android.widget.FrameLayout? = null
+    private var drawerOverlay: View? = null
+    private var drawerView: View? = null
+    private var drawerOpen = false
+    private var fullscreen = false
+    private var sessionEngineLabel: String = LinuxSandbox.ENGINE_TERMUX
+
+    // Termux/ZeroTermux color palette
+    private val bg = Color.rgb(18, 18, 18)
+    private val panel = Color.rgb(28, 28, 28)
+    private val bar = Color.rgb(38, 38, 38)
+    private val keyBg = Color.rgb(48, 48, 48)
+    private val keyActiveBg = Color.rgb(68, 68, 68)
+    private val fg = Color.rgb(232, 232, 232)
+    private val accent = Color.rgb(80, 180, 80)
+    private val accentBlue = Color.rgb(80, 140, 200)
+    private val accentRed = Color.rgb(200, 80, 80)
+    private val accentOrange = Color.rgb(200, 140, 60)
+    private val muted = Color.rgb(140, 140, 140)
+    private val drawerBg = Color.rgb(25, 25, 30)
+
+    // Special key states
+    private var ctrlActive = false
+    private var altActive = false
+    private var fnActive = false
+
+    fun buildView(): View {
+        val dir = cwd ?: host.state.workspace.rootDir()
+        val env: Map<String, String> = emptyMap() // 会话环境由 bootTerminal() 按引擎选择
+
+        root = LinearLayout(host.context).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+        }
+
+        // === 1. Toolbar ===
+        val tb = LinearLayout(host.context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(bar)
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+        }
+        tb.addView(toolbarButton("\u2039", accentRed) { closePage() })
+        tb.addView(TextView(host.context).apply {
+            text = "Terminal"; textSize = 14f; typeface = Typeface.DEFAULT_BOLD
+            setTextColor(fg); setPadding(dp(10), 0, dp(10), 0)
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+        tb.addView(toolbarChip("A-") { terminal.decreaseFont() })
+        tb.addView(toolbarChip("A+") { terminal.increaseFont() })
+        tb.addView(toolbarChip("COPY") { terminal.copyVisibleText(); host.toast("\u5df2\u590d\u5236") })
+        tb.addView(toolbarChip("PASTE") { terminal.pasteFromClipboard() })
+        tb.addView(toolbarChip("CLR") { terminal.writeText("\u000c") })
+        tb.addView(toolbarChip("\u22ee") { showMenu() })
+        root!!.addView(tb, LinearLayout.LayoutParams(-1, dp(44)))
+
+        // === 2. Session bar ===
+        val sessionBar = LinearLayout(host.context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(bg)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+        }
+        sessionBar.addView(TextView(host.context).apply {
+            text = " SHELL"; textSize = 9f; typeface = Typeface.DEFAULT_BOLD
+            setTextColor(accent)
+            setBackgroundColor(panel)
+            setPadding(dp(8), dp(3), dp(8), dp(3))
+        })
+        sessionTitle = TextView(host.context).apply {
+            text = "  ${dir.absolutePath}"; textSize = 9f; typeface = Typeface.MONOSPACE
+            setTextColor(muted); maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.START
+            setPadding(dp(8), 0, 0, 0)
+        }
+        sessionBar.addView(sessionTitle, LinearLayout.LayoutParams(0, -2, 1f))
+        root!!.addView(sessionBar, LinearLayout.LayoutParams(-1, dp(28)))
+
+        // === 3. Terminal view ===
+        terminal = NativeTerminalView(host.context)
+        terminal.onStatus = { msg -> host.runUi { status.text = msg } }
+        terminal.onTitleChanged = { t -> host.runUi { sessionTitle.text = "  ${if (t.isBlank()) sessionEngineLabel else t}" } }
+        terminal.onSessionExit = { code -> host.runUi { status.text = "Process completed · code=$code" } }
+        terminal.onSwipeRight = { openDrawer() }
+        terminal.onSwipeLeft = { closeDrawer() }
+        terminal.onLongPress = { showContextMenu() }
+        val terminalCard = LinearLayout(host.context).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(panel)
+            setPadding(dp(2), dp(2), dp(2), dp(2))
+        }
+        terminalCard.addView(terminal, LinearLayout.LayoutParams(-1, 0, 1f))
+        root!!.addView(terminalCard, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        // === 4. Status bar ===
+        status = TextView(host.context).apply {
+            text = "PTY · ${dir.absolutePath}"; textSize = 8.5f; typeface = Typeface.MONOSPACE
+            setTextColor(muted); setBackgroundColor(bg)
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+        }
+        root!!.addView(status, LinearLayout.LayoutParams(-1, dp(20)))
+
+        // === 5. Extra keys row (primary) ===
+        root!!.addView(buildExtraKeysRow(), LinearLayout.LayoutParams(-1, dp(38)))
+
+        // === 6. Special keys row (secondary) ===
+        root!!.addView(buildSpecialKeysRow(), LinearLayout.LayoutParams(-1, dp(38)))
+
+        // === 7. Number row ===
+        root!!.addView(buildNumberRow(), LinearLayout.LayoutParams(-1, dp(34)))
+
+        terminal.post {
+            bootTerminal(dir)
+        }
+        // 页面容器：FrameLayout 内含主内容 + 抽屉
+        val frame = android.widget.FrameLayout(host.context).apply { setBackgroundColor(bg) }
+        frame.addView(root, android.widget.FrameLayout.LayoutParams(-1, -1))
+        rootFrame = frame
+        return frame
+    }
+
+    // ================= 右划功能抽屉 =================
+
+    private fun openDrawer() {
+        if (drawerOpen) return
+        drawerOpen = true
+        val overlay = View(host.context).apply {
+            setBackgroundColor(0x88000000.toInt())
+            setOnClickListener { closeDrawer() }
+        }
+        val drawer = buildDrawerView()
+        val parent = rootFrame ?: return
+        parent.addView(overlay, ViewGroup.LayoutParams(-1, -1))
+        parent.addView(drawer, android.widget.FrameLayout.LayoutParams(dp(290), -1, Gravity.START))
+        drawer.translationX = -dp(290).toFloat()
+        drawer.animate().translationX(0f).setDuration(200).start()
+        overlay.alpha = 0f
+        overlay.animate().alpha(1f).setDuration(200).start()
+        drawerOverlay = overlay
+        drawerView = drawer
+    }
+
+    private fun closeDrawer() {
+        if (!drawerOpen) return
+        drawerOpen = false
+        val parent = rootFrame ?: return
+        val d = drawerView
+        val o = drawerOverlay
+        if (d == null || parent.indexOfChild(d) < 0) {
+            if (o != null && parent.indexOfChild(o) >= 0) parent.removeView(o)
+            drawerView = null; drawerOverlay = null
+            return
+        }
+        d.animate()?.translationX(-dp(290).toFloat())?.setDuration(160)?.withEndAction {
+            parent.removeView(d)
+            if (o != null && parent.indexOfChild(o) >= 0) parent.removeView(o)
+            drawerView = null; drawerOverlay = null
+        }?.start()
+        o?.animate()?.alpha(0f)?.setDuration(160)?.start()
+    }
+
+    private fun closeDrawerNow() {
+        drawerOpen = false
+        val parent = rootFrame ?: return
+        drawerView?.let { if (parent.indexOfChild(it) >= 0) parent.removeView(it) }
+        drawerOverlay?.let { if (parent.indexOfChild(it) >= 0) parent.removeView(it) }
+        drawerView = null; drawerOverlay = null
+    }
+
+    /** 在终端中直接执行命令（关闭抽屉并聚焦终端）。 */
+    private fun runInTerminal(cmd: String) {
+        closeDrawerNow()
+        terminal.writeText(cmd + "\r")
+        terminal.requestFocus()
+    }
+
+    /** 在终端中执行多段命令。 */
+    private fun runChain(vararg cmds: String) {
+        runInTerminal(cmds.joinToString(" && "))
+    }
+
+    private fun buildDrawerView(): View {
+        val scroll = android.widget.ScrollView(host.context).apply {
+            setBackgroundColor(drawerBg)
+            isVerticalScrollBarEnabled = true
+            isScrollbarFadingEnabled = true
+        }
+        val content = LinearLayout(host.context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(24), dp(16), dp(24))
+        }
+
+        // Header
+        content.addView(TextView(host.context).apply {
+            text = "GitHubK Studio"; textSize = 18f; typeface = Typeface.DEFAULT_BOLD
+            setTextColor(fg)
+        })
+        content.addView(TextView(host.context).apply {
+            text = "\u7248\u672c: 5.0.0\n\u5f15\u64ce: ${if (host.state.runtime.isInstalled()) "Termux" else "\u672a\u88c5"}/PTY"
+            textSize = 11f; typeface = Typeface.MONOSPACE; setTextColor(muted)
+            setPadding(0, dp(4), 0, dp(16))
+        })
+
+        // ============ \u4f1a\u8bdd\u7ba1\u7406 ============
+        content.addView(drawerSection("\u4f1a\u8bdd\u7ba1\u7406"))
+        content.addView(drawerItem("\u65b0\u5efa\u4f1a\u8bdd", accent) { closeDrawerNow(); host.openTerminal(cwd) })
+        content.addView(drawerItem("\u91cd\u542f Shell", accent) { closeDrawerNow(); restart() })
+        content.addView(drawerItem("\u5173\u95ed\u7ec8\u7aef", accentRed) { closePage() })
+
+        // ============ \u7ec8\u7aef\u8bbe\u7f6e ============
+        content.addView(drawerSection("\u7ec8\u7aef\u8bbe\u7f6e"))
+        content.addView(drawerItem("\u5b57\u4f53\u5927\u5c0f", accent) { showFontSettings() })
+        content.addView(drawerItem("\u5b57\u4f53\u653e\u5927", accent) { closeDrawerAndFocus(); terminal.increaseFont() })
+        content.addView(drawerItem("\u5b57\u4f53\u7f29\u5c0f", accent) { closeDrawerAndFocus(); terminal.decreaseFont() })
+        content.addView(drawerItem("\u914d\u8272\u4e3b\u9898", accent) { showColorThemeDialog() })
+        content.addView(drawerItem("\u663e\u793a/\u9690\u85cf\u952e\u76d8", accent) { closeDrawerAndFocus(); toggleKeyboard() })
+        content.addView(drawerItem("\u5168\u5c4f\u6a21\u5f0f", accent) { toggleFullscreen() })
+        content.addView(drawerItem("\u6e05\u7a7a\u5c4f\u5e55", accent) { runInTerminal("\u000c") })
+        content.addView(drawerItem("\u56de\u5230\u9876\u90e8", accent) { closeDrawerAndFocus(); terminal.scrollToTop() })
+        content.addView(drawerItem("\u56de\u5230\u5e95\u90e8", accent) { closeDrawerAndFocus(); terminal.scrollToBottom() })
+
+        // ============ \u7ec8\u7aef\u64cd\u4f5c ============
+        content.addView(drawerSection("\u7ec8\u7aef\u64cd\u4f5c"))
+        content.addView(drawerItem("\u590d\u5236\u5168\u90e8", accentBlue) { terminal.copyVisibleText(); host.toast("\u5df2\u590d\u5236") })
+        content.addView(drawerItem("\u7c98\u8d34", accentBlue) { terminal.pasteFromClipboard(); host.toast("\u5df2\u7c98\u8d34") })
+        content.addView(drawerItem("\u9001 Ctrl+C", accentRed) { runInTerminalKey("\u0003") })
+        content.addView(drawerItem("\u9001 Ctrl+D (EOF)", accentRed) { runInTerminalKey("\u0004") })
+        content.addView(drawerItem("\u9001 Ctrl+Z", accentRed) { runInTerminalKey("\u001a") })
+        content.addView(drawerItem("\u9001 Tab", accent) { runInTerminalKey("\t") })
+        content.addView(drawerItem("\u9001 ESC", accent) { runInTerminalKey("\u001b") })
+
+        // ============ \u5feb\u6377\u547d\u4ee4 ============
+        content.addView(drawerSection("\u5feb\u6377\u547d\u4ee4"))
+        content.addView(drawerItem("ls -la", accentBlue) { runInTerminal("ls -la") })
+        content.addView(drawerItem("pwd", accentBlue) { runInTerminal("pwd") })
+        content.addView(drawerItem("whoami", accentBlue) { runInTerminal("whoami && id") })
+        content.addView(drawerItem("\u5386\u53f2\u547d\u4ee4", accentBlue) { runInTerminal("history") })
+        content.addView(drawerItem("\u73af\u5883\u53d8\u91cf", accentBlue) { runInTerminal("env | sort") })
+        content.addView(drawerItem("date", accentBlue) { runInTerminal("date") })
+        content.addView(drawerItem("uptime", accentBlue) { runInTerminal("uptime") })
+        content.addView(drawerItem("cal", accentBlue) { runInTerminal("cal") })
+
+        // ============ \u6587\u4ef6\u7ba1\u7406 ============
+        content.addView(drawerSection("\u6587\u4ef6\u7ba1\u7406"))
+        content.addView(drawerItem("\u5f53\u524d\u76ee\u5f55\u6811", accent) { runInTerminal("ls -la") })
+        content.addView(drawerItem("\u65b0\u5efa\u76ee\u5f55", accent) { showInput("\u65b0\u5efa\u76ee\u5f55", "\u76ee\u5f55\u540d", "") { n -> runInTerminal("mkdir -p \"$n\" && ls -la") } })
+        content.addView(drawerItem("\u65b0\u5efa\u6587\u4ef6", accent) { showInput("\u65b0\u5efa\u6587\u4ef6", "\u6587\u4ef6\u540d", "") { n -> runInTerminal("touch \"$n\" && ls -la") } })
+        content.addView(drawerItem("\u5220\u9664\u6587\u4ef6/\u76ee\u5f55", accentRed) { showInput("\u5220\u9664", "\u8def\u5f84 (\u6ce8\u610f\uff1a\u65e0\u6cd5\u64a4\u9500)", "") { n -> runInTerminal("rm -rf \"$n\"") } })
+        content.addView(drawerItem("\u67e5\u770b\u6587\u4ef6", accent) { showInput("\u67e5\u770b\u6587\u4ef6", "\u6587\u4ef6\u540d", "") { n -> runInTerminal("cat \"$n\"") } })
+        content.addView(drawerItem("\u7f16\u8f91\u6587\u4ef6 (nano)", accent) { showInput("\u7f16\u8f91\u6587\u4ef6", "\u6587\u4ef6\u540d", "") { n -> runInTerminal("nano \"$n\"") } })
+        content.addView(drawerItem("\u7f16\u8f91\u6587\u4ef6 (vim)", accent) { showInput("\u7f16\u8f91\u6587\u4ef6", "\u6587\u4ef6\u540d", "") { n -> runInTerminal("vim \"$n\"") } })
+        content.addView(drawerItem("\u67e5\u627e\u6587\u4ef6", accent) { showInput("\u67e5\u627e\u6587\u4ef6", "\u5173\u952e\u8bcd", "") { n -> runInTerminal("find . -iname \"*$n*\" 2>/dev/null | head -30") } })
+        content.addView(drawerItem("\u67e5\u770b\u6587\u4ef6\u5927\u5c0f", accent) { runInTerminal("du -sh * 2>/dev/null | sort -rh | head -20") })
+        content.addView(drawerItem("\u78c1\u76d8\u7a7a\u95f4", accent) { runInTerminal("df -h") })
+        content.addView(drawerItem("\u5f53\u524d\u76ee\u5f55\u4e0a\u4f20", accent) { host.toast("\u8bf7\u5728\u5de5\u4f5c\u533a\u4e2d\u4f7f\u7528\u5bfc\u5165") })
+
+        // ============ \u7f51\u7edc\u5de5\u5177 ============
+        content.addView(drawerSection("\u7f51\u7edc\u5de5\u5177"))
+        content.addView(drawerItem("IP \u5730\u5740", accentBlue) { runInTerminal("ip addr 2>/dev/null | grep -E 'inet ' || ifconfig 2>/dev/null") })
+        content.addView(drawerItem("Ping \u6d4b\u8bd5", accentBlue) { showInput("Ping", "\u4e3b\u673a/\u57df\u540d", "8.8.8.8") { n -> runInTerminal("ping -c 4 \"$n\"") } })
+        content.addView(drawerItem("\u67e5 DNS", accentBlue) { showInput("DNS \u67e5\u8be2", "\u57df\u540d", "github.com") { n -> runInTerminal("nslookup \"$n\" 2>/dev/null || dig \"$n\" 2>/dev/null") } })
+        content.addView(drawerItem("curl \u8bf7\u6c42", accentBlue) { showInput("curl", "URL", "https://api.github.com") { n -> runInTerminal("curl -sL \"$n\" | head -30") } })
+        content.addView(drawerItem("\u4e0b\u8f7d\u6587\u4ef6", accentBlue) { showInput("\u4e0b\u8f7d", "URL", "https://") { n -> runInTerminal("wget \"$n\" && ls -lh") } })
+        content.addView(drawerItem("\u7aef\u53e3\u72b6\u6001", accentBlue) { runInTerminal("ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null") })
+        content.addView(drawerItem("\u8def\u7531\u8868", accentBlue) { runInTerminal("route -n 2>/dev/null || ip route") })
+        content.addView(drawerItem("\u542f\u52a8 HTTP \u670d\u52a1", accentBlue) { runInTerminal("python -m http.server 8080") })
+        content.addView(drawerItem("SSH \u8fde\u63a5", accentBlue) { showInput("SSH", "user@host", "") { n -> runInTerminal("pkg install -y openssh 2>/dev/null; ssh \"$n\"") } })
+
+        // ============ \u5305\u7ba1\u7406 ============
+        content.addView(drawerSection("\u5305\u7ba1\u7406 (pkg)"))
+        content.addView(drawerItem("pkg update", accent) { runInTerminal("pkg update") })
+        content.addView(drawerItem("pkg upgrade", accent) { runInTerminal("pkg upgrade -y") })
+        content.addView(drawerItem("\u5b89\u88c5\u5305", accent) { showInput("\u5b89\u88c5\u5305", "\u5305\u540d", "") { n -> runInTerminal("pkg install -y \"$n\"") } })
+        content.addView(drawerItem("\u5378\u8f7d\u5305", accent) { showInput("\u5378\u8f7d\u5305", "\u5305\u540d", "") { n -> runInTerminal("pkg uninstall -y \"$n\"") } })
+        content.addView(drawerItem("\u641c\u7d22\u5305", accent) { showInput("\u641c\u7d22\u5305", "\u5173\u952e\u8bcd", "") { n -> runInTerminal("pkg search \"$n\"") } })
+        content.addView(drawerItem("\u5df2\u88c5\u5305\u5217\u8868", accent) { runInTerminal("pkg list-installed") })
+        content.addView(drawerItem("\u6e05\u7406\u7f13\u5b58", accent) { runInTerminal("pkg clean; pkg autoclean") })
+
+        // ============ \u7cfb\u7edf\u76d1\u63a7 ============
+        content.addView(drawerSection("\u7cfb\u7edf\u76d1\u63a7"))
+        content.addView(drawerItem("top", accentOrange) { runInTerminal("top -bn1 | head -20") })
+        content.addView(drawerItem("ps", accentOrange) { runInTerminal("ps aux | head -25") })
+        content.addView(drawerItem("\u5185\u5b58", accentOrange) { runInTerminal("free -h") })
+        content.addView(drawerItem("uname -a", accentOrange) { runInTerminal("uname -a") })
+        content.addView(drawerItem("CPU \u4fe1\u606f", accentOrange) { runInTerminal("cat /proc/cpuinfo | head -20") })
+        content.addView(drawerItem("\u6740\u6b7b\u8fdb\u7a0b", accentRed) { showInput("kill", "PID", "") { n -> runInTerminal("kill -9 \"$n\"") } })
+        content.addView(drawerItem("jobs", accentOrange) { runInTerminal("jobs -l") })
+
+        // ============ Git ============
+        content.addView(drawerSection("Git"))
+        content.addView(drawerItem("git status", accent) { runInTerminal("git status") })
+        content.addView(drawerItem("git log", accent) { runInTerminal("git log --oneline -15") })
+        content.addView(drawerItem("git diff", accent) { runInTerminal("git diff") })
+        content.addView(drawerItem("git branch", accent) { runInTerminal("git branch -a") })
+        content.addView(drawerItem("git pull", accent) { runInTerminal("git pull") })
+        content.addView(drawerItem("git push", accent) { runInTerminal("git push") })
+        content.addView(drawerItem("git add+commit", accent) { showInput("Commit", "\u63d0\u4ea4\u4fe1\u606f", "") { n -> runInTerminal("git add -A && git commit -m \"$n\"") } })
+
+        // ============ \u5bb9\u5668 & PRoot ============
+        content.addView(drawerSection("\u5bb9\u5668 & PRoot"))
+        content.addView(drawerItem("\u5b89\u88c5 proot-distro", accentOrange) { runInTerminal("pkg install -y proot-distro") })
+        content.addView(drawerItem("\u5b89\u88c5 Ubuntu", accentOrange) { runInTerminal("proot-distro install ubuntu") })
+        content.addView(drawerItem("\u767b\u5f55 Ubuntu", accentOrange) { runInTerminal("proot-distro login ubuntu") })
+        content.addView(drawerItem("\u5b89\u88c5 Kali", accentOrange) { runInTerminal("proot-distro install kali") })
+        content.addView(drawerItem("\u767b\u5f55 Kali", accentOrange) { runInTerminal("proot-distro login kali") })
+        content.addView(drawerItem("\u5b89\u88c5 Debian", accentOrange) { runInTerminal("proot-distro install debian") })
+        content.addView(drawerItem("\u5b89\u88c5 Alpine", accentOrange) { runInTerminal("proot-distro install alpine") })
+        content.addView(drawerItem("\u5b89\u88c5 Arch", accentOrange) { runInTerminal("proot-distro install archlinux") })
+
+        // ============ \u5b89\u5168\u5de5\u5177 ============
+        content.addView(drawerSection("\u5b89\u5168\u5de5\u5177"))
+        content.addView(drawerItem("Nmap \u626b\u63cf", accentRed) { showInput("Nmap", "\u76ee\u6807 IP/\u57df\u540d", "127.0.0.1") { n -> runInTerminal("pkg install -y nmap 2>/dev/null; nmap \"$n\"") } })
+        content.addView(drawerItem("Metasploit", accentRed) { runInTerminal("pkg install -y metasploit-framework 2>/dev/null; msfconsole -q") })
+        content.addView(drawerItem("Sqlmap", accentRed) { showInput("Sqlmap", "\u76ee\u6807 URL", "http://") { n -> runInTerminal("pkg install -y sqlmap 2>/dev/null; sqlmap -u \"$n\" --batch") } })
+        content.addView(drawerItem("Hydra", accentRed) { runInTerminal("pkg install -y hydra 2>/dev/null; hydra -h | head -20") })
+        content.addView(drawerItem("Wireshark", accentRed) { runInTerminal("pkg install -y tshark 2>/dev/null; tshark --version") })
+
+        // ============ \u5f00\u53d1\u73af\u5883 ============
+        content.addView(drawerSection("\u5f00\u53d1\u73af\u5883"))
+        content.addView(drawerItem("\u5b89\u88c5\u5f00\u53d1\u5de5\u5177\u96c6", accent) { runInTerminal("pkg install -y git python nodejs vim nano htop tmux openssh clang make cmake") })
+        content.addView(drawerItem("\u5b89\u88c5 Ruby", accent) { runInTerminal("pkg install -y ruby") })
+        content.addView(drawerItem("\u5b89\u88c5 Go", accent) { runInTerminal("pkg install -y golang") })
+        content.addView(drawerItem("\u5b89\u88c5 Rust", accent) { runInTerminal("pkg install -y rust") })
+        content.addView(drawerItem("\u5b89\u88c5 Java", accent) { runInTerminal("pkg install -y openjdk-17") })
+        content.addView(drawerItem("\u5b89\u88c5 ADB", accent) { runInTerminal("pkg install -y android-tools") })
+        content.addView(drawerItem("\u5b89\u88c5 Docker", accent) { runInTerminal("pkg install -y docker") })
+        content.addView(drawerItem("\u67e5\u770b\u8bed\u8a00\u7248\u672c", accent) { runInTerminal("python --version 2>&1; node -v 2>&1; go version 2>&1; java -version 2>&1; gcc --version 2>&1 | head -1; ruby -v 2>&1") })
+
+        // ============ \u811a\u672c\u914d\u7f6e ============
+        content.addView(drawerSection("\u811a\u672c\u914d\u7f6e"))
+        content.addView(drawerItem("\u7f16\u8f91 .bashrc", accent) { runInTerminal("nano ~/.bashrc") })
+        content.addView(drawerItem("\u7f16\u8f91 .profile", accent) { runInTerminal("nano ~/.profile") })
+        content.addView(drawerItem("\u7f16\u8f91 .vimrc", accent) { runInTerminal("nano ~/.vimrc") })
+        content.addView(drawerItem("\u7f16\u8f91 .ssh/config", accent) { runInTerminal("mkdir -p ~/.ssh && nano ~/.ssh/config") })
+        content.addView(drawerItem("\u91cd\u8f7d\u914d\u7f6e", accent) { runInTerminal("source ~/.bashrc 2>/dev/null; echo 'Done'") })
+        content.addView(drawerItem("\u8bbe\u7f6e PS1", accent) { runInTerminal("echo 'export PS1=\"\\[\\033[01;32m\\]\\u@\\h\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$ \"' >> ~/.bashrc; source ~/.bashrc") })
+        content.addView(drawerItem("\u5f00\u542f\u989c\u8272", accent) { runInTerminal("echo 'export TERM=xterm-256color' >> ~/.bashrc; source ~/.bashrc") })
+
+        // ============ \u5feb\u6377\u811a\u672c ============
+        content.addView(drawerSection("\u5feb\u6377\u811a\u672c"))
+        content.addView(drawerItem("\u4e00\u952e\u73af\u5883", accent) { runInTerminal("pkg update && pkg upgrade -y && pkg install -y git python nodejs vim nano htop tmux openssh clang make cmake") })
+        content.addView(drawerItem("\u5907\u4efd\u914d\u7f6e", accent) { runInTerminal("tar czf ~/githubk_backup.tar.gz ~/.bashrc ~/.profile ~/.ssh 2>/dev/null; echo 'Backup done'") })
+        content.addView(drawerItem("\u6062\u590d\u914d\u7f6e", accent) { runInTerminal("tar xzf ~/githubk_backup.tar.gz -C ~/ 2>/dev/null; source ~/.bashrc; echo 'Restore done'") })
+        content.addView(drawerItem("\u7cfb\u7edf\u4fee\u590d", accentOrange) { runInTerminal("termux-change-repo 2>/dev/null; pkg update; echo 'Done'") })
+        content.addView(drawerItem("\u67e5\u770b\u65e5\u5fd7", accent) { runInTerminal("cat ~/githubk.log 2>/dev/null || echo 'No log file'") })
+        content.addView(drawerItem("\u5173\u4e8e", accent) { showAboutDialog() })
+
+        scroll.addView(content)
+        return scroll
+    }
+
+    // ================= \u62bd\u5c49\u8f85\u52a9\u65b9\u6cd5 =================
+
+    private fun drawerSection(title: String): View =
+        TextView(host.context).apply {
+            text = title; textSize = 10f; typeface = Typeface.DEFAULT_BOLD
+            setTextColor(accent)
+            setPadding(0, dp(20), 0, dp(6))
+        }
+
+    private fun drawerItem(label: String, color: Int, action: () -> Unit): View =
+        TextView(host.context).apply {
+            text = label; textSize = 12f; typeface = Typeface.DEFAULT
+            setTextColor(fg)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            isClickable = true; isFocusable = true
+            val tv = android.util.TypedValue()
+            host.context.theme.resolveAttribute(android.R.attr.selectableItemBackground, tv, true)
+            setBackgroundResource(tv.resourceId)
+            setOnClickListener {
+                performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                action()
+            }
+        }
+
+    private fun closeDrawerAndFocus() {
+        closeDrawerNow()
+        terminal.requestFocus()
+    }
+
+    private fun runInTerminalKey(key: String) {
+        closeDrawerNow()
+        terminal.write(key)
+        terminal.requestFocus()
+    }
+
+    // ================= \u5bf9\u8bdd\u6846 =================
+
+    private fun showInput(title: String, hint: String, default: String, callback: (String) -> Unit) {
+        val et = EditText(host.context).apply {
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(default)
+            setHint(hint)
+            setTextColor(fg); setHintTextColor(muted)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setBackgroundColor(panel)
+        }
+        AlertDialog.Builder(host.context)
+            .setTitle(title)
+            .setView(et)
+            .setPositiveButton("\u786e\u5b9a") { _, _ -> callback(et.text.toString().trim()) }
+            .setNegativeButton("\u53d6\u6d88", null)
+            .show()
+    }
+
+    private fun showFontSettings() {
+        val sizes = arrayOf("10", "12", "14", "16", "18", "20", "22", "24")
+        AlertDialog.Builder(host.context)
+            .setTitle("\u5b57\u4f53\u5927\u5c0f")
+            .setItems(sizes) { _, which ->
+                val sz = sizes[which].toInt()
+                terminal.setFontSize(sz)
+                closeDrawerAndFocus()
+            }
+            .setNegativeButton("\u53d6\u6d88", null)
+            .show()
+    }
+
+    private fun showColorThemeDialog() {
+        val themes = arrayOf("Dark (\u9ed8\u8ba4)", "Light", "Solarized Dark", "Dracula", "Monokai", "Nord", "Gruvbox")
+        AlertDialog.Builder(host.context)
+            .setTitle("\u914d\u8272\u4e3b\u9898")
+            .setItems(themes) { _, which ->
+                val esc = when (which) {
+                    0 -> "\u001b]11;rgb:1212/1212/1212\u0007"
+                    1 -> "\u001b]11;rgb:ee/ee/ee\u0007"
+                    2 -> "\u001b]11;rgb:2c/30/36\u0007"
+                    3 -> "\u001b]11;rgb:28/2a/36\u0007"
+                    4 -> "\u001b]11;rgb:27/28/22\u0007"
+                    5 -> "\u001b]11;rgb:2e/34/40\u0007"
+                    6 -> "\u001b]11;rgb:28/28/28\u0007"
+                    else -> ""
+                }
+                terminal.write(esc)
+                closeDrawerAndFocus()
+                host.toast("\u5df2\u5207\u6362: ${themes[which]}")
+            }
+            .setNegativeButton("\u53d6\u6d88", null)
+            .show()
+    }
+
+    private fun showAboutDialog() {
+        AlertDialog.Builder(host.context)
+            .setTitle("GitHubK Studio")
+            .setMessage("Version 5.0.0\nTerminal Engine: Native PTY + VT\n\n\u539f\u751f\u7ec8\u7aef\uff0c\u771f\u5b9e PTY \u8fde\u63a5\u3002\n\u652f\u6301 VT100/ANSI \u8f6c\u4e49\u5e8f\u5217\u3001\n\u81ea\u5b9a\u4e49\u914d\u8272\u3001\u591a\u4f1a\u8bdd\u3001\nPRoot \u5bb9\u5668\u3001\u5b89\u5168\u5de5\u5177\u3001\n\u5f00\u53d1\u73af\u5883\u4e00\u952e\u5b89\u88c5\u3002")
+            .setPositiveButton("\u786e\u5b9a", null)
+            .show()
+    }
+
+    private fun showMenu() {
+        val popup = PopupWindow(host.context)
+        val items = arrayOf("\u590d\u5236", "\u7c98\u8d34", "\u6e05\u5c4f", "\u5b57\u4f53+", "\u5b57\u4f53-", "\u5168\u5c4f", "\u5173\u95ed")
+        val list = LinearLayout(host.context).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bar)
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+        }
+        popup.contentView = list
+        popup.width = dp(160)
+        popup.height = android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+        popup.isFocusable = true
+        items.forEachIndexed { i, label ->
+            val tv = TextView(host.context).apply {
+                text = label; textSize = 12f; setTextColor(fg)
+                setPadding(dp(16), dp(12), dp(16), dp(12))
+                isClickable = true
+                setOnClickListener {
+                    popup.dismiss()
+                    when (i) {
+                        0 -> { terminal.copyVisibleText(); host.toast("\u5df2\u590d\u5236") }
+                        1 -> terminal.pasteFromClipboard()
+                        2 -> terminal.writeText("\u000c")
+                        3 -> terminal.increaseFont()
+                        4 -> terminal.decreaseFont()
+                        5 -> toggleFullscreen()
+                        6 -> closePage()
+                    }
+                }
+            }
+            list.addView(tv)
+        }
+        popup.showAsDropDown(root, dp(200), dp(44))
+    }
+
+    private fun showContextMenu() {
+        val items = arrayOf("\u590d\u5236", "\u7c98\u8d34", "\u9001 Ctrl+C", "\u9001 Tab", "\u5b57\u4f53+", "\u5b57\u4f53-", "\u5168\u5c4f")
+        AlertDialog.Builder(host.context)
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> { terminal.copyVisibleText(); host.toast("\u5df2\u590d\u5236") }
+                    1 -> terminal.pasteFromClipboard()
+                    2 -> terminal.write("\u0003")
+                    3 -> terminal.write("\t")
+                    4 -> terminal.increaseFont()
+                    5 -> terminal.decreaseFont()
+                    6 -> toggleFullscreen()
+                }
+            }
+            .setNegativeButton("\u53d6\u6d88", null)
+            .show()
+    }
+
+    // ================= \u952e\u76d8\u680f =================
+
+    private fun buildExtraKeysRow(): View {
+        val scroll = HorizontalScrollView(host.context).apply {
+            isHorizontalScrollBarEnabled = false
+            setBackgroundColor(keyBg)
+        }
+        val row = LinearLayout(host.context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val keys = listOf(
+            "ESC" to { terminal.write("\u001b") },
+            "TAB" to { terminal.write("\t") },
+            "CTRL" to { ctrlActive = !ctrlActive; host.toast(if (ctrlActive) "CTRL \u5df2\u9501\u5b9a" else "CTRL \u5df2\u91ca\u653e") },
+            "ALT" to { altActive = !altActive; host.toast(if (altActive) "ALT \u5df2\u9501\u5b9a" else "ALT \u5df2\u91ca\u653e") },
+            "\u2014" to { terminal.write("-") },
+            "/" to { terminal.write("/") },
+            "|" to { terminal.write("|") },
+            "~" to { terminal.write("~") },
+            "$" to { terminal.write("$") },
+            "{" to { terminal.write("{") },
+            "}" to { terminal.write("}") },
+            "[" to { terminal.write("[") },
+            "]" to { terminal.write("]") },
+            "<" to { terminal.write("<") },
+            ">" to { terminal.write(">") },
+            "=" to { terminal.write("=") },
+            "\\" to { terminal.write("\\") },
+            ";" to { terminal.write(";") },
+            "'" to { terminal.write("'") },
+            "\"" to { terminal.write("\"") },
+            "`" to { terminal.write("`") },
+            "^" to { terminal.write("^") },
+            "*" to { terminal.write("*") },
+            "&" to { terminal.write("&") },
+            "#" to { terminal.write("#") },
+            "%" to { terminal.write("%") },
+            "+" to { terminal.write("+") },
+            "_" to { terminal.write("_") },
+            "(" to { terminal.write("(") },
+            ")" to { terminal.write(")") },
+            "!" to { terminal.write("!") },
+            "?" to { terminal.write("?") },
+            "@" to { terminal.write("@") }
+        )
+        keys.forEach { (label, action) ->
+            row.addView(keyButton(label) {
+                if (ctrlActive) {
+                    val c = label.lowercase().firstOrNull() ?: 'a'
+                    terminal.write((c.code - 96).toChar().toString())
+                    ctrlActive = false
+                } else if (altActive) {
+                    terminal.write("\u001b" + label)
+                    altActive = false
+                } else {
+                    action()
+                }
+            })
+        }
+        scroll.addView(row)
+        return scroll
+    }
+
+    private fun buildSpecialKeysRow(): View {
+        val scroll = HorizontalScrollView(host.context).apply {
+            isHorizontalScrollBarEnabled = false
+            setBackgroundColor(keyBg)
+        }
+        val row = LinearLayout(host.context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val keys = listOf(
+            "\u2190" to { terminal.sendArrowKey("left") },
+            "\u2193" to { terminal.sendArrowKey("down") },
+            "\u2191" to { terminal.sendArrowKey("up") },
+            "\u2192" to { terminal.sendArrowKey("right") },
+            "HOME" to { terminal.write("\u001b[H") },
+            "END" to { terminal.write("\u001b[F") },
+            "PGUP" to { terminal.scrollPage(-1) },
+            "PGDN" to { terminal.scrollPage(1) },
+            "DEL" to { terminal.write("\u001b[3~") },
+            "BKSP" to { terminal.write("\b") },
+            "ENTER" to { terminal.write("\r") },
+            "SPACE" to { terminal.write(" ") },
+            "CTRL-C" to { terminal.write("\u0003") },
+            "CTRL-Z" to { terminal.write("\u001a") },
+            "CTRL-D" to { terminal.write("\u0004") },
+            "CTRL-L" to { terminal.write("\u000c") },
+            "CTRL-R" to { terminal.write("\u0012") },
+            "CTRL-A" to { terminal.write("\u0001") },
+            "CTRL-E" to { terminal.write("\u0005") },
+            "CTRL-W" to { terminal.write("\u0017") },
+            "CTRL-U" to { terminal.write("\u0015") },
+            "CTRL-K" to { terminal.write("\u000b") },
+            "F1" to { terminal.write("\u001bOP") },
+            "F2" to { terminal.write("\u001bOQ") },
+            "F3" to { terminal.write("\u001bOR") },
+            "F4" to { terminal.write("\u001bOS") }
+        )
+        keys.forEach { (label, action) ->
+            row.addView(keyButton(label) { action() })
+        }
+        scroll.addView(row)
+        return scroll
+    }
+
+    private fun buildNumberRow(): View {
+        val row = LinearLayout(host.context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(keyBg)
+        }
+        val chars = "1234567890"
+        for (c in chars) {
+            row.addView(keyButton(c.toString()) { terminal.write(c.toString()) })
+        }
+        return row
+    }
+
+    // ================= \u952e\u76d8\u6309\u94ae =================
+
+    private fun keyButton(label: String, action: () -> Unit): View {
+        val tv = TextView(host.context).apply {
+            text = label; textSize = 11f; typeface = Typeface.MONOSPACE
+            setTextColor(fg)
+            gravity = Gravity.CENTER
+            setBackgroundColor(keyBg)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            isClickable = true; isFocusable = true
+            setOnTouchListener { v, e ->
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        v.setBackgroundColor(keyActiveBg)
+                        v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        v.setBackgroundColor(keyBg)
+                        action()
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        v.setBackgroundColor(keyBg)
+                    }
+                }
+                true
+            }
+        }
+        return tv
+    }
+
+    // ================= \u5de5\u5177\u680f\u6309\u94ae =================
+
+    private fun toolbarButton(label: String, color: Int, action: () -> Unit): View =
+        TextView(host.context).apply {
+            text = label; textSize = 18f; typeface = Typeface.DEFAULT_BOLD
+            setTextColor(color)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            isClickable = true
+            setOnClickListener { action() }
+        }
+
+    private fun toolbarChip(label: String, action: () -> Unit): View =
+        TextView(host.context).apply {
+            text = label; textSize = 9f; typeface = Typeface.DEFAULT_BOLD
+            setTextColor(fg)
+            gravity = Gravity.CENTER
+            setBackgroundColor(keyBg)
+            setPadding(dp(8), dp(5), dp(8), dp(5))
+            val lp = LinearLayout.LayoutParams(-2, -2)
+            lp.setMargins(dp(3), 0, dp(3), 0)
+            layoutParams = lp
+            isClickable = true
+            setOnClickListener { action() }
+        }
+
+    // ================= \u5176\u4ed6\u529f\u80fd =================
+
+    private fun toggleKeyboard() {
+        val imm = host.context.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+        if (imm.isAcceptingText) {
+            imm.hideSoftInputFromWindow(terminal.windowToken, 0)
+        } else {
+            terminal.requestFocus()
+            imm.showSoftInput(terminal, 0)
+        }
+    }
+
+    private fun toggleFullscreen() {
+        fullscreen = !fullscreen
+        host.runUi {
+            root?.let { r ->
+                for (i in 0 until r.childCount) {
+                    when (i) {
+                        0, 1, 3 -> r.getChildAt(i).visibility = if (fullscreen) View.GONE else View.VISIBLE
+                    }
+                }
+            }
+        }
+        host.toast(if (fullscreen) "全屏模式" else "退出全屏")
+    }
+
+    private fun restart() {
+        terminal.stop()
+        val dir = cwd ?: host.state.workspace.rootDir()
+        terminal.post {
+            bootTerminal(dir)
+        }
+    }
+
+    /**
+     * 启动 PTY 会话。优先 proot + Linux(rootfs) 沙盒引擎；rootfs 未装时
+     * 自动从 assets 离线安装；proot 不可用则回退 Termux(legacy) 引擎。
+     */
+    private fun bootTerminal(dir: File) {
+        val ctx = host.context
+        val hostDir = if (dir.exists()) dir.absolutePath else ctx.filesDir.absolutePath
+        val supported = LinuxSandbox.isSupported(ctx)
+        if (supported && !LinuxSandbox.isRootfsInstalled(ctx)) {
+            status.text = "正在安装 Linux 沙盒（离线 rootfs）…"
+            val t = Thread {
+                val ok = LinuxSandbox.installRootfs(ctx) { p ->
+                    host.runUi { status.text = "Linux 沙盒安装中… ${(p * 100).toInt()}%" }
+                }
+                host.runUi {
+                    if (ok) {
+                        status.text = "Linux 沙盒就绪 ✓"
+                        startTerminal(dir, hostDir, proot = true)
+                    } else {
+                        status.text = "Linux 沙盒安装失败，回退 Termux 引擎"
+                        startTerminal(dir, hostDir, proot = false)
+                    }
+                }
+            }
+            t.isDaemon = true
+            t.start()
+            return
+        }
+        startTerminal(dir, hostDir, proot = supported)
+    }
+
+    private fun startTerminal(dir: File, hostDir: String, proot: Boolean) {
+        val ctx = host.context
+        // 优先：Termux(runtime) + proot 沙盒（复用已装工具链，无需 Alpine rootfs）。
+        // 注意：此处默认【非 root】运行。Termux 的 apt/pkg 官方检测到 EUID=0 会
+        // "disabled permanently"（防止 root 破坏 app 私有目录所有权），而 proot 的
+        // --root-id 只是伪造 uid、无内核特权，runtime 文件本就属于 app 自身，
+        // 非 root 即可 chmod/chown/apt install 等。若确需 root 视图可传 root=true。
+        val rt = host.state.runtime
+        if (TermuxSandbox.available(ctx) && rt.isInstalled()) {
+            val termbin = LinuxSandbox.prootBinary(ctx)!!
+            // 修复被改写的 Termux 脚本 shebang，保证 pkg/apt/termux-* 原生命令可运行
+            runCatching { TermuxSandbox.ensureGuestShebangs(rt.root) }
+            // apt/dpkg 崩溃残留锁清理（被杀进程后 lock 会卡死后续包管理）
+            runCatching { rt.cleanupDpkgLocks() }
+            // 首次安装后后台拉取软件源（仅 proot 通道，不阻塞 UI，不弹 Shizuku）
+            runCatching { rt.scheduleAptUpdateIfPending() }
+            val argv = listOf(termbin.absolutePath) + TermuxSandbox.loginArgv(ctx, rt.root, hostDir, root = false)
+            sessionEngineLabel = "Termux · proot"
+            // 终端登录使用【纯净 Termux 环境】rt.env()：PATH 仅含 $PREFIX/bin 与系统目录，
+            // 不注入 IDE 的 JAVA_HOME/ANDROID_HOME/GRADLE_HOME 等绝对路径，避免两类环境互相污染。
+            // IDE 编译所需 JDK/SDK/Gradle 仍由 BuildEngine/Agent 通过 toolchainEnv() 单独注入。
+            terminal.start(termbin.absolutePath, hostDir, TermuxSandbox.processEnv(ctx, rt.root, rt.env()), argv)
+            status.text = "PTY · Termux+proot · ${dir.absolutePath}"
+            initialCommand?.let { cmd ->
+                terminal.postDelayed({ terminal.writeText(cmd + "\r") }, 500)
+            }
+            return
+        }
+        if (proot) {
+            val bin = LinuxSandbox.prootBinary(ctx)!!
+            val argv = listOf(bin.absolutePath) + LinuxSandbox.loginArgv(ctx, hostDir)
+            sessionEngineLabel = "Linux · proot"
+            terminal.start(bin.absolutePath, hostDir, LinuxSandbox.guestEnv(ctx), argv)
+            status.text = "PTY · proot+Alpine · ${dir.absolutePath}"
+        } else {
+            val bash = host.state.runtime.bashPath()
+            val shell = if (bash != null && File(bash).canExecute()) bash else "/system/bin/sh"
+            val env = linkedMapOf<String, String>()
+            env.putAll(host.state.runtime.env())
+            env["TERM"] = "xterm-256color"; env["COLORTERM"] = "truecolor"
+            env["HOME"] = env["HOME"] ?: File(ctx.filesDir, "home").apply { mkdirs() }.absolutePath
+            env["TMPDIR"] = env["TMPDIR"] ?: File(ctx.cacheDir, "tmp").apply { mkdirs() }.absolutePath
+            env["LANG"] = env["LANG"] ?: "C.UTF-8"; env["LC_ALL"] = env["LC_ALL"] ?: "C.UTF-8"
+            sessionEngineLabel = "Termux"
+            terminal.start(shell, hostDir, env)
+            status.text = "PTY · Termux · ${dir.absolutePath}"
+        }
+        initialCommand?.let { cmd ->
+            terminal.postDelayed({ terminal.writeText(cmd + "\r") }, 500)
+        }
+    }
+
+    private fun closePage() {
+        if (::terminal.isInitialized) {
+            terminal.stop()
+        }
+        host.popPage()
+    }
+
+    fun onResume() {
+        if (::terminal.isInitialized) {
+            terminal.onResume()
+            terminal.requestFocus()
+        }
+    }
+
+    fun onPause() {
+        if (::terminal.isInitialized) {
+            terminal.onPause()
+        }
+    }
+
+    private fun dp(v: Int) = UiKit.dp(host.context, v)
+}
