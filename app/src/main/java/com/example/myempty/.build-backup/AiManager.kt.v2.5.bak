@@ -1,0 +1,223 @@
+package com.example.myempty.githubk.ai
+
+import android.content.Context
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.app.AlertDialog
+import com.example.myempty.githubk.core.SecureStore
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+
+data class AiConfig(
+    val provider: String,
+    val endpoint: String,
+    val model: String,
+    val key: String
+)
+
+data class ChatMessage(val role: String, val content: String)
+
+/**
+ * AiManager v2.5
+ * - 支持 openai / compatible / deepseek / qwen / glm / openrouter / anthropic / gemini
+ * - Gemini Key 使用请求头 x-goog-api-key，不再拼接 URL（避免进入日志/代理）
+ * - 支持多轮消息历史 chat(messages)，供 AgentRuntime 使用
+ * - 所有 IO 显式 UTF-8
+ */
+class AiManager(private val c: Context) {
+
+    private val sec = SecureStore(c)
+
+    private val presets = mapOf(
+        "openai" to Pair("https://api.openai.com/v1/chat/completions", "gpt-4o-mini"),
+        "compatible" to Pair("https://api.openai.com/v1/chat/completions", "gpt-4o-mini"),
+        "deepseek" to Pair("https://api.deepseek.com/chat/completions", "deepseek-chat"),
+        "qwen" to Pair("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen-plus"),
+        "glm" to Pair("https://open.bigmodel.cn/api/paas/v4/chat/completions", "glm-4-flash"),
+        "openrouter" to Pair("https://openrouter.ai/api/v1/chat/completions", "openai/gpt-4o-mini"),
+        "anthropic" to Pair("https://api.anthropic.com/v1/messages", "claude-3-5-haiku-latest"),
+        "gemini" to Pair("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent", "gemini-2.0-flash")
+    )
+
+    fun config(): AiConfig = AiConfig(
+        sec.get("provider").orEmpty().ifBlank { "compatible" },
+        sec.get("endpoint") ?: "",
+        sec.get("model") ?: "",
+        sec.get("key") ?: ""
+    )
+
+    fun dialog(ctx: Context, onSaved: () -> Unit = {}) {
+        val box = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(20, 8, 20, 8)
+        }
+        // Provider 快捷选择（chips）
+        val provRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        val providers = listOf("compatible", "openai", "deepseek", "qwen", "glm", "gemini", "anthropic", "openrouter")
+        var selected = sec.get("provider").orEmpty().ifBlank { "compatible" }
+        val chips = mutableListOf<android.widget.TextView>()
+        val provider = EditText(ctx).apply {
+            hint = "Provider"
+            setText(selected)
+            textSize = 13f
+        }
+        fun renderProviderRow() {
+            provRow.removeAllViews()
+            chips.clear()
+            providers.forEach { p ->
+                val chip = com.example.myempty.githubk.ui.UiKit.chip(ctx, labelOf(p), selected == p) {
+                    selected = p
+                    provider.setText(p)
+                    renderProviderRow()
+                }
+                provRow.addView(chip)
+                provRow.addView(android.widget.Space(ctx).apply {
+                    layoutParams = LinearLayout.LayoutParams(6.dp(ctx), 1)
+                })
+                chips.add(chip)
+            }
+        }
+        val endpoint = EditText(ctx).apply { hint = "Endpoint（留空用预设）"; setText(sec.get("endpoint") ?: ""); textSize = 13f }
+        val model = EditText(ctx).apply { hint = "Model"; setText(sec.get("model") ?: ""); textSize = 13f }
+        val key = EditText(ctx).apply { hint = "API Key"; setSingleLine(true); textSize = 13f }
+        box.addView(com.example.myempty.githubk.ui.UiKit.label(ctx, "服务商", color = com.example.myempty.githubk.R.color.muted, size = 12f))
+        box.addView(provRow)
+        box.addView(android.widget.Space(ctx).apply { layoutParams = LinearLayout.LayoutParams(1, 8.dp(ctx)) })
+        listOf(provider, endpoint, model, key).forEach {
+            box.addView(it)
+            box.addView(android.widget.Space(ctx).apply { layoutParams = LinearLayout.LayoutParams(1, 6.dp(ctx)) })
+        }
+        box.addView(com.example.myempty.githubk.ui.UiKit.label(ctx, "支持 OpenAI 兼容 / DeepSeek / 通义千问 / 智谱 GLM / Gemini / Claude / OpenRouter", color = com.example.myempty.githubk.R.color.muted, size = 11f))
+        renderProviderRow()
+        com.example.myempty.githubk.ui.UiKit.dialog(ctx, "AI Provider 配置", box, onOk = {
+            val p = provider.text.toString().trim().lowercase()
+            val preset = presets[p]
+            sec.put("provider", p)
+            sec.put("endpoint", endpoint.text.toString().trim().ifBlank { preset?.first ?: "" })
+            sec.put("model", model.text.toString().trim().ifBlank { preset?.second ?: "" })
+            if (key.text.isNotBlank()) sec.put("key", key.text.toString().trim())
+            onSaved()
+        }, onCancel = {})
+    }
+
+    private fun labelOf(p: String): String = when (p) {
+        "openai" -> "OpenAI"
+        "deepseek" -> "DeepSeek"
+        "qwen" -> "通义千问"
+        "glm" -> "智谱GLM"
+        "gemini" -> "Gemini"
+        "anthropic" -> "Claude"
+        "openrouter" -> "OpenRouter"
+        else -> "兼容模式"
+    }
+
+    private fun Int.dp(c: Context): Int = (this * c.resources.displayMetrics.density).toInt()
+
+    /** 单轮（保留兼容 2.4 接口） */
+    fun runAgent(task: String, context: String): String {
+        if (config().key.isBlank()) return "请先在设置中配置 AI API Key。"
+        return try {
+            chat(listOf(ChatMessage("user", task)), context)
+        } catch (e: Throwable) {
+            "AI 请求失败：${e.message}"
+        }
+    }
+
+    /** 多轮对话：messages 为完整历史，system 为可选系统提示。 */
+    fun chat(messages: List<ChatMessage>, system: String? = null): String {
+        val cfg = config()
+        if (cfg.key.isBlank()) throw IllegalStateException("未配置 API Key")
+        return when (cfg.provider.lowercase()) {
+            "anthropic" -> anthropic(cfg, messages, system)
+            "gemini" -> gemini(cfg, messages, system)
+            else -> openAi(cfg, messages, system)
+        }
+    }
+
+    private fun post(url: String, headers: Map<String, String>, body: String): String {
+        val x = URL(url).openConnection() as HttpURLConnection
+        x.requestMethod = "POST"
+        x.doOutput = true
+        x.connectTimeout = 30000
+        x.readTimeout = 180000
+        headers.forEach { x.setRequestProperty(it.key, it.value) }
+        x.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        x.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        val stream = if (x.responseCode in 200..299) x.inputStream else x.errorStream
+        val text = stream?.bufferedReader(Charsets.UTF_8)?.readText() ?: ("HTTP " + x.responseCode)
+        if (x.responseCode !in 200..299) throw RuntimeException("HTTP ${x.responseCode}: ${text.take(500)}")
+        return text
+    }
+
+    private fun systemPrompt(ctx: String): String = """You are GitHubK Studio, a mobile coding agent that manages Android/Flutter projects.
+Workspace:
+$ctx
+
+You can call tools by returning exactly:
+<TOOL name="tool_name">{"path":"...","query":"..."}</TOOL>
+
+Available tools: list_projects, list_files, file_tree, read_file, write_file, search_code, delete_file, build, git_status, git_diff, git_branch, git_commit, git_push.
+
+For file changes, return exact full file contents using:
+<FILE path="project/relative/path">content</FILE>
+
+Rules:
+- project must be an existing project name from list_projects.
+- Write complete files, never fragments.
+- After changes, call build to verify. Fix errors by reading and rewriting files.
+- Keep changes minimal and buildable. Do not invent paths.
+- When done, summarize what you changed."""
+
+    // ---------------- OpenAI 兼容 ----------------
+
+    private fun openAi(c: AiConfig, messages: List<ChatMessage>, system: String?): String {
+        val arr = JSONArray()
+        system?.let { arr.put(JSONObject().put("role", "system").put("content", it)) }
+        messages.forEach { arr.put(JSONObject().put("role", it.role).put("content", it.content)) }
+        val body = JSONObject().put("model", c.model).put("messages", arr).toString()
+        val headers = mutableMapOf("Authorization" to "Bearer ${c.key}")
+        if (c.provider.equals("openrouter", true)) {
+            headers["HTTP-Referer"] = "https://github.com"
+            headers["X-Title"] = "GitHubK Studio"
+        }
+        val o = JSONObject(post(c.endpoint, headers, body))
+        return o.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")?.optString("content")
+            ?: o.optString("error") ?: o.toString(2)
+    }
+
+    // ---------------- Anthropic ----------------
+
+    private fun anthropic(c: AiConfig, messages: List<ChatMessage>, system: String?): String {
+        val arr = JSONArray()
+        messages.forEach { arr.put(JSONObject().put("role", it.role).put("content", it.content)) }
+        val body = JSONObject()
+            .put("model", c.model)
+            .put("max_tokens", 8192)
+            .put("messages", arr)
+        system?.let { body.put("system", it) }
+        val url = if (c.endpoint.contains("messages")) c.endpoint else c.endpoint.trimEnd('/') + "/v1/messages"
+        val o = JSONObject(post(url, mapOf("x-api-key" to c.key, "anthropic-version" to "2023-06-01"), body.toString()))
+        return o.optJSONArray("content")?.optJSONObject(0)?.optString("text") ?: o.optString("error") ?: o.toString(2)
+    }
+
+    // ---------------- Gemini (P1 修复：Key 放 Header) ----------------
+
+    private fun gemini(c: AiConfig, messages: List<ChatMessage>, system: String?): String {
+        val base = c.endpoint.replace("{model}", c.model).replace("?key=", "&key=")
+        val contents = JSONArray()
+        messages.forEach { m ->
+            val role = if (m.role == "assistant") "model" else "user"
+            contents.put(JSONObject().put("role", role).put("parts", JSONArray().put(JSONObject().put("text", m.content))))
+        }
+        val body = JSONObject()
+        system?.let { body.put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", it)))) }
+        body.put("contents", contents)
+        val o = JSONObject(post(base, mapOf("x-goog-api-key" to c.key), body.toString()))
+        return o.optJSONArray("candidates")?.optJSONObject(0)?.optJSONObject("content")?.optJSONArray("parts")?.optJSONObject(0)?.optString("text")
+            ?: o.optString("error") ?: o.toString(2)
+    }
+}
