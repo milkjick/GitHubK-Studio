@@ -605,6 +605,13 @@ class RepoManagePage(private val host: PageHost, private val repo: GitRepo) {
 
         content.addView(UiKit.spacer(c, 8))
 
+        // 更改仓库状态（仅 owner）：公开/私有 切换 + 描述编辑
+        content.addView(actionRow(
+            R.drawable.ic_edit, ThemeManager.colors.warning, "更改仓库状态",
+            if (isOwner) "切换公开 / 私有，或编辑仓库描述（仅所有者可改）" else "仅仓库所有者可修改状态",
+        ) { if (isOwner) showChangeState(fresh) else host.toast("仅仓库所有者可修改状态") })
+        content.addView(UiKit.spacer(c, 8))
+
         // 重命名（仅 owner）
         content.addView(actionRow(
             R.drawable.ic_edit, ThemeManager.colors.primary, "重命名仓库",
@@ -705,6 +712,55 @@ class RepoManagePage(private val host: PageHost, private val repo: GitRepo) {
                 }
             }
         }.start()
+    }
+
+    /**
+     * 更改仓库状态：切换公开/私有、编辑描述。
+     */
+    private fun showChangeState(fresh: GitRepo) {
+        if (busy) return
+        val box = UiKit.vstack(c).apply {
+            setPadding(UiKit.dp(c, 20), UiKit.dp(c, 10), UiKit.dp(c, 20), UiKit.dp(c, 10))
+        }
+        val descInput = UiKit.textArea(c, "仓库描述").apply {
+            setText(fresh.description)
+        }
+        box.addView(UiKit.label(c, "可见性", color = R.color.muted, size = 12.5f))
+        var currentPrivate = fresh.private
+        val privSwitch = UiKit.switchRow(
+            c,
+            if (currentPrivate) "仓库为私有" else "仓库为公开",
+            if (currentPrivate) "仅你可见（关闭改为公开仓库）" else "所有人可见（打开设为私有仓库）",
+            initial = currentPrivate,
+        ) { v -> currentPrivate = v }
+        box.addView(privSwitch)
+        box.addView(UiKit.spacer(c, 10))
+        box.addView(UiKit.label(c, "描述", color = R.color.muted, size = 12.5f))
+        box.addView(descInput)
+        box.addView(UiKit.spacer(c, 6))
+        box.addView(UiKit.label(c, "切换可见性/编辑描述需要仓库拥有者权限及正确的 Token。",
+            color = R.color.muted, size = 11f))
+        UiKit.dialog(c, "更改仓库状态", box, onOk = {
+            val newDesc = descInput.text.toString().trim()
+            if (newDesc == fresh.description && currentPrivate == fresh.private) {
+                host.toast("未做任何修改")
+                return@dialog
+            }
+            busy = true
+            setStatus("正在更新仓库状态…")
+            Thread {
+                val ok = api.updateRepo(
+                    fresh.fullName,
+                    isPrivate = if (currentPrivate != fresh.private) currentPrivate else null,
+                    description = if (newDesc != fresh.description) newDesc else null
+                )
+                host.runUi {
+                    busy = false
+                    setStatus(if (ok) "仓库状态已更新" else "更新失败：请检查 Token / 权限")
+                    if (ok) refresh(fresh)
+                }
+            }.start()
+        }, onCancel = {})
     }
 
     private fun showRename(fresh: GitRepo) {
