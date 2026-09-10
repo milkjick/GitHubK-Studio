@@ -1,0 +1,7 @@
+// Local-build profile: AGP 8.2.0 + Kotlin 1.9.20 (offline proot SDK 34).
+// The original upstream profile (AGP 9.1.1 + Gradle 9.3.1 + compileSdk 36)
+// is preserved in .build-backup/ for environments that provide them.
+plugins {
+    id 'com.android.application' version '8.2.0' apply false
+    id 'org.jetbrains.kotlin.android' version '1.9.20' apply false
+}
