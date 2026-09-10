@@ -1,0 +1,790 @@
+package com.example.myempty.githubk.terminal
+
+import com.example.myempty.githubk.terminal.ShizukuShell
+
+import android.content.Context
+import android.os.Build
+import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLConnection
+import java.nio.file.Files
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
+import org.json.JSONObject
+
+/**
+ * BuiltinRuntime v3（参考 Termux/ZeroTermux bootstrap 安装流程）：
+ *
+ * 在应用私有目录内置完整 POSIX 运行时（Termux 官方 bootstrap，aarch64）。
+ *
+ * 安装流程：
+ * 1. 下载 Termux 官方最新 bootstrap-aarch64.zip
+ * 2. 解压到 filesDir/runtime/（bin/ etc/ lib/ share/ ...）
+ * 3. 处理 SYMLINKS.txt 创建符号链接
+ * 4. 设置文件权限（bin/ 可执行、lib/ 可读）
+ * 5. 如有 Shizuku，用 shell 用户 chmod -R 755 确保可访问
+ *
+ * 运行方式：
+ * - 普通设备：app 直接 exec bash（untrusted_app 域）
+ * - 华为/鸿蒙：Shizuku 以 shell 用户 exec bash（shell 域允许 exec app_data_file）
+ */
+class BuiltinRuntime(private val c: Context) {
+
+    val root: File = File(c.filesDir, "runtime")
+    val prefix: String get() = root.absolutePath
+    val home: File = File(root, "home")
+    val tmp: File = File(root, "tmp")
+
+    // Termux bootstrap 中 usr/ 的前缀（符号链接需要重写）
+    private val TERMUX_PREFIX = "/data/data/com.termux/files/usr"
+
+    fun isInstalled(): Boolean = File(root, "bin/bash").exists() && File(root, "bin/bash").length() > 100000
+
+    fun supported(): Boolean =
+        Build.SUPPORTED_ABIS?.any { it.contains("arm64") } == true
+
+    private companion object {
+        // Official Termux apt-android-7 bootstrap. Pinned instead of using /latest so
+        // a future incompatible bootstrap cannot silently break an installed runtime.
+        const val BOOTSTRAP_VERSION = "2026.02.12-r1%2Bapt.android-7"
+        const val BOOTSTRAP_AARCH64_SHA256 = "ea2aeba8819e517db711f8c32369e89e7c52cee73e07930ff91185e1ab93f4f3"
+
+        // Termux APT 软件源候选（顺序即尝试顺序）：国内镜像优先，官方源兜底。
+        val APT_SOURCES = listOf(
+            "deb https://mirrors.tuna.tsinghua.edu.cn/termux/apt/termux-main stable main",
+            "deb https://mirrors.ustc.edu.cn/termux/apt/termux-main stable main",
+            "deb https://mirrors.bfsu.edu.cn/termux/apt/termux-main stable main",
+            "deb https://packages-cf.termux.dev/apt/termux-main stable main"
+        )
+
+        // bootstrap zip 下载候选（顺序即尝试顺序）：GitHub 直连 + 常用加速镜像。
+        val BOOTSTRAP_DOWNLOAD_PREFIXES = listOf(
+            "https://github.com",
+            "https://ghfast.top/https://github.com",
+            "https://gh-proxy.com/https://github.com",
+            "https://ghproxy.net/https://github.com"
+        )
+    }
+
+    fun bootstrapUrl(): String =
+        "https://github.com/termux/termux-packages/releases/download/bootstrap-$BOOTSTRAP_VERSION/bootstrap-aarch64.zip"
+
+    private fun latestBootstrapUrl(): String? = bootstrapUrl()
+
+    /** 环境变量（供 ProcessBuilder / Shizuku 使用）。 */
+    fun env(): Map<String, String> = mutableMapOf(
+        "PREFIX" to prefix,
+        "HOME" to home.absolutePath,
+        "TMPDIR" to tmp.absolutePath,
+        "LANG" to "C.UTF-8",
+        "LC_ALL" to "C.UTF-8",
+        "PATH" to "$prefix/bin:$prefix/bin/applets:/system/bin:/system/xbin",
+        "LD_LIBRARY_PATH" to "$prefix/lib",
+        "TERM" to "xterm-256color",
+        "TERMUX_APP__PACKAGE_NAME" to c.packageName,
+        "TERMUX_VERSION" to "0.118",
+        "TERMUX_APK_RELEASE" to "githubk",
+        "TERMUX_PREFIX" to prefix,
+        "SHELL" to "$prefix/bin/bash",
+        "COLORTERM" to "truecolor",
+        "EDITOR" to "nano",
+        "VISUAL" to "nano",
+        "ANDROID_DATA" to "/data",
+        "ANDROID_ROOT" to "/system"
+    )
+
+    fun bashPath(): String? {
+        if (!isInstalled()) return null
+        // 启动前确保脚本 shebang 已修复（对已存在的 runtime 也生效）
+        try { fixShebangs() } catch (_: Throwable) {}
+        // 启动前确保可执行权限
+        try { forceFixPermissions() } catch (_: Throwable) {}
+        return File(root, "bin/bash").absolutePath
+    }
+
+    /**
+     * 安装内置运行时：优先读取 APK 离线包（当前版本不再打包误标的 IDE 包），
+     * 缺失时自动从 Termux 官方 GitHub release API 获取最新 bootstrap。
+     */
+    fun install(onProgress: (Float) -> Unit) {
+        root.mkdirs()
+        onProgress(0.02f)
+
+        // APK assets 才是可靠的离线来源。旧实现错误地把 APK 内部路径
+        // /sdcard/projects/... 当成真实文件路径，导致“安装成功但 bash 不存在”。
+        val installedFromAsset = runCatching {
+            c.assets.open("bootstrap-aarch64.zip").use { input ->
+                val zip = File(c.cacheDir, "githubk-bootstrap.zip")
+                FileOutputStream(zip).use { input.copyTo(it) }
+                onProgress(0.18f)
+                extract(zip, root) { p -> onProgress(0.18f + p * 0.70f) }
+                zip.delete()
+                prepare()
+                // 强制修复可执行权限：APK 解压后二进制可能丢失 exec 位
+                forceFixPermissions()
+                isInstalled()
+            }
+        }.getOrDefault(false)
+
+        if (installedFromAsset) {
+            onProgress(0.95f)
+            // 这个 bootstrap 是 POSIX/终端基础运行时，不包含 JDK/Gradle/Android SDK。
+            // 编译环境由“IDE 环境中心”单独安装，避免把两种环境混为一谈。
+            onProgress(1f)
+            return
+        }
+
+        // APK 中没有离线包时，才走网络下载。
+        onProgress(0.10f)
+        installFromNetwork(onProgress)
+        if (!isInstalled()) throw IllegalStateException("运行时安装完成但 bash 校验失败")
+        onProgress(1f)
+    }
+    
+    /** 通过 Shizuku 批量修复所有脚本的 shebang 和硬编码路径。 */
+    private fun fixAllScripts() {
+        if (!ShizukuShell.isServiceAvailable() || !ShizukuShell.hasPermission()) return
+        
+        val old = "/data/data/com.termux/files/usr"
+        val new = "/data/data/com.example.myempty.githubk/files/runtime"
+        
+        // 批量替换 bin/ 和 libexec/ 下所有文件中的旧路径
+        val cmd = "run-as com.example.myempty.githubk sh -c '" +
+            "old=\"\$old\"; new=\"\$new\"; " +
+            "for file in /data/data/com.example.myempty.githubk/files/runtime/bin/* /data/data/com.example.myempty.githubk/files/runtime/libexec/*; do " +
+            "[ -f \"\$file\" ] && grep -q \"\$old\" \"\$file\" 2>/dev/null && sed -i \"s|\$old|\$new|g\" \"\$file\"; " +
+            "done; " +
+            "chmod -R 755 /data/data/com.example.myempty.githubk/files/runtime/bin; " +
+            "chmod -R 755 /data/data/com.example.myempty.githubk/files/runtime/lib" +
+            "'"
+        
+        ShizukuShell.execAsApp(cmd, timeoutSec = 60)
+    }
+    
+    /** 用 ZipFile 解压（最可靠，支持大文件）。 */
+    private fun extractWithZipFile(zipFile: File, dest: File, onProgress: (Float) -> Unit) {
+        java.util.zip.ZipFile(zipFile).use { zf ->
+            val entries = zf.entries()
+            var count = 0
+            val total = zf.size()
+            while (entries.hasMoreElements()) {
+                val entry = entries.nextElement()
+                val name = entry.name
+                if (name == "SYMLINKS.txt") {
+                    val symFile = File(dest, "SYMLINKS.txt")
+                    symFile.parentFile?.mkdirs()
+                    zf.getInputStream(entry).use { input ->
+                        FileOutputStream(symFile).use { out ->
+                            input.copyTo(out)
+                        }
+                    }
+                } else if (entry.isDirectory) {
+                    val dir = File(dest, name)
+                    dir.mkdirs()
+                    try { dir.setExecutable(true, false); dir.setReadable(true, false) } catch (_: Throwable) {}
+                } else {
+                    val outFile = File(dest, name)
+                    outFile.parentFile?.mkdirs()
+                    zf.getInputStream(entry).use { input ->
+                        FileOutputStream(outFile).use { out ->
+                            input.copyTo(out)
+                        }
+                    }
+                    val isExec = name.startsWith("bin/") || name.startsWith("libexec/")
+                    val isLib = name.startsWith("lib/") || name.endsWith(".so")
+                    try {
+                        outFile.setReadable(true, false)
+                        if (isExec) outFile.setExecutable(true, false)
+                        if (isLib) outFile.setExecutable(true, false)
+                    } catch (_: Throwable) {}
+                }
+                count++
+                if (count % 20 == 0) {
+                    onProgress(0.1f + (count.toFloat() / total) * 0.75f)
+                }
+            }
+        }
+    }
+    
+    /** 从网络下载 bootstrap 并安装（回退方案）。 */
+    private fun installFromNetwork(onProgress: (Float) -> Unit) {
+        root.mkdirs()
+        val zipFile = File(c.cacheDir, "bootstrap.zip")
+        // GitHub 直连 + 多个加速镜像逐个尝试，解决国内下载慢/失败问题。
+        val rel = "termux/termux-packages/releases/download/bootstrap-$BOOTSTRAP_VERSION/bootstrap-aarch64.zip"
+        var downloaded = false
+        var lastErr = "unknown"
+        for (base in BOOTSTRAP_DOWNLOAD_PREFIXES) {
+            try {
+                onProgress(0.10f)
+                download(base + "/" + rel, zipFile, onProgress)
+                downloaded = true
+                break
+            } catch (e: Throwable) {
+                lastErr = e.message ?: e.javaClass.simpleName
+                runCatching { zipFile.delete() }
+            }
+        }
+        if (!downloaded) throw IllegalStateException("Termux bootstrap 下载失败：$lastErr")
+        val actual = sha256(zipFile)
+        if (!actual.equals(BOOTSTRAP_AARCH64_SHA256, ignoreCase = true)) {
+            zipFile.delete()
+            throw IllegalStateException("Termux bootstrap SHA-256 校验失败：$actual")
+        }
+        onProgress(0.92f)
+        root.deleteRecursively()
+        root.mkdirs()
+        extract(zipFile, root)
+        prepare()
+        forceFixPermissions()
+        zipFile.delete()
+    }
+
+    private fun sha256(file: File): String {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buf = ByteArray(128 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        return md.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun download(url: String, dest: File, onProgress: (Float) -> Unit) {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.instanceFollowRedirects = true
+        conn.connectTimeout = 30000
+        conn.readTimeout = 60000
+        conn.setRequestProperty("User-Agent", "GitHubK-Studio/4.0")
+        try {
+            val code = conn.responseCode
+            if (code !in 200..299) throw RuntimeException("下载失败 HTTP $code")
+            val total = conn.contentLength.toLong()
+            conn.inputStream.use { input ->
+                FileOutputStream(dest).use { out ->
+                    val buf = ByteArray(128 * 1024)
+                    var read: Int
+                    var done = 0L
+                    while (input.read(buf).also { read = it } != -1) {
+                        out.write(buf, 0, read)
+                        done += read
+                        if (total > 0) onProgress((done.toFloat() / total * 0.85f).coerceIn(0f, 0.85f))
+                    }
+                }
+            }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /**
+     * 解压 zip（参考 Termux BootstrapInstaller）。
+     * 关键：设置可执行权限 + 可读权限。
+     */
+    private fun extract(zipFile: File, dest: File, onProgress: ((Float) -> Unit)? = null) {
+        ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
+            var entry: ZipEntry? = zis.nextEntry
+            var count = 0
+            while (entry != null) {
+                val name = entry.name.replace('\\', '/')
+                val target = File(dest, name).canonicalFile
+                val base = dest.canonicalFile
+                require(target.path == base.path || target.path.startsWith(base.path + File.separator)) {
+                    "Unsafe zip entry: $name"
+                }
+                if (name == "SYMLINKS.txt") {
+                    target.parentFile?.mkdirs()
+                    FileOutputStream(target).use { zis.copyTo(it) }
+                } else if (entry.isDirectory) {
+                    target.mkdirs()
+                    target.setExecutable(true, false)
+                    target.setReadable(true, false)
+                } else {
+                    target.parentFile?.mkdirs()
+                    FileOutputStream(target).use { zis.copyTo(it) }
+                    val isExec = name.startsWith("bin/") || name.startsWith("libexec/")
+                    val isLib = name.startsWith("lib/") || name.endsWith(".so")
+                    target.setReadable(true, false)
+                    if (isExec || isLib) target.setExecutable(true, false)
+                }
+                count++
+                if (count % 20 == 0) onProgress?.invoke((count % 1000) / 1000f)
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
+            onProgress?.invoke(1f)
+        }
+    }
+
+    /** 创建 home/tmp，处理符号链接，写 .bashrc。 */
+    private fun prepare() {
+        try { home.mkdirs() } catch (_: Throwable) {}
+        try { tmp.mkdirs() } catch (_: Throwable) {}
+        // 递归设置目录权限
+        try { setDirPermissionsRecursive(root) } catch (_: Throwable) {}
+
+        // Official Termux bootstraps are built for com.termux. A fork must rebuild
+        // packages for its own prefix; for this embedded runtime we aggressively
+        // rewrite textual launcher/config paths and provide our own pkg wrapper.
+        rewriteTermuxPrefixReferences()
+        installPortablePkgWrapper()
+
+        // 处理 SYMLINKS.txt
+        try {
+            val f = File(root, "SYMLINKS.txt")
+            if (f.exists()) {
+                f.readLines().forEach { line ->
+                    val idx = line.indexOf('←')
+                    if (idx > 0) {
+                        val linkPath = line.substring(0, idx).trim()
+                        val target = line.substring(idx + 1).trim()
+                        // 重写 Termux 前缀为我们的路径
+                        val localLink = linkPath.removePrefix(TERMUX_PREFIX).removePrefix("/")
+                        val linkFile = File(root, localLink)
+                        if (!linkFile.exists()) {
+                            try {
+                                linkFile.parentFile?.mkdirs()
+                                val relTarget = relativeToRoot(target)
+                                val targetFile = File(root, relTarget)
+                                Files.createSymbolicLink(linkFile.toPath(), targetFile.toPath())
+                            } catch (_: Throwable) {
+                                // 符号链接失败时尝试复制文件
+                                try {
+                                    val relTarget = relativeToRoot(target)
+                                    val targetFile = File(root, relTarget)
+                                    if (targetFile.exists() && targetFile.isFile) {
+                                        linkFile.parentFile?.mkdirs()
+                                        targetFile.copyTo(linkFile, overwrite = true)
+                                        linkFile.setExecutable(true, false)
+                                        linkFile.setReadable(true, false)
+                                    }
+                                } catch (_: Throwable) {}
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_: Throwable) {}
+
+        // .bashrc
+        try {
+            File(home, ".bashrc").writeText(buildString {
+                append("export PREFIX=$prefix\n")
+                append("export HOME=$home\n")
+                append("export TMPDIR=$tmp\n")
+                append("export PATH=$prefix/bin:$prefix/bin/applets:/system/bin:/system/xbin\n")
+                append("export LD_LIBRARY_PATH=$prefix/lib\n")
+                append("export LANG=C.UTF-8\n")
+                append("export TERM=xterm-256color\n")
+                append("export TERMUX_VERSION=0.118\n")
+                append("alias ll='ls -la'\n")
+                append("alias la='ls -a'\n")
+                append("alias ..='cd ..'\n")
+                append("alias grep='grep --color=auto'\n")
+                append("PS1='\\[\\e[32m\\]\\u@githubk\\[\\e[0m\\]:\\[\\e[34m\\]\\w\\[\\e[0m\\]\\$ '\n")
+            })
+        } catch (_: Throwable) {}
+
+        // .profile
+        try {
+            File(home, ".profile").writeText(
+                "[ -f ~/.bashrc ] && source ~/.bashrc\n"
+            )
+        } catch (_: Throwable) {}
+
+        // 修复 shebang 路径（将 /data/data/com.termux/ 替换为实际路径）
+        fixShebangs()
+
+        // 创建关键符号链接 bin/sh -> bin/bash
+        try {
+            val shLink = File(root, "bin/sh")
+            if (!shLink.exists()) {
+                Files.createSymbolicLink(shLink.toPath(), File(root, "bin/bash").toPath())
+            }
+        } catch (_: Throwable) {}
+
+        // 创建 bin/env 符号链接（指向 /system/bin/env 或 busybox env）
+        try {
+            val envLink = File(root, "bin/env")
+            if (!envLink.exists()) {
+                val target = File("/system/bin/env")
+                if (target.exists()) {
+                    Files.createSymbolicLink(envLink.toPath(), target.toPath())
+                }
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun rewriteTermuxPrefixReferences() {
+        val oldRoot = "/data/data/com.termux/files"
+        val oldPrefix = "/data/data/com.termux/files/usr"
+        val newRoot = root.absolutePath
+        val newPrefix = prefix
+        val roots = listOf(File(root, "bin"), File(root, "libexec"), File(root, "etc"), File(root, "share"))
+        roots.filter { it.exists() }.forEach { dir ->
+            dir.walkTopDown().filter { it.isFile && it.length() <= 2L * 1024L * 1024L }.forEach { f ->
+                runCatching {
+                    val bytes = f.readBytes()
+                    if (bytes.any { it == 0.toByte() }) return@runCatching
+                    val text = bytes.toString(Charsets.UTF_8)
+                    if (text.contains(oldRoot) || text.contains(oldPrefix)) {
+                        f.writeText(text.replace(oldRoot, newRoot).replace(oldPrefix, newPrefix), Charsets.UTF_8)
+                    }
+                }
+            }
+        }
+        runCatching {
+            val aptEtc = File(root, "etc/apt")
+            aptEtc.mkdirs()
+            // 清理 sources.list.d 旧配置，避免双源冲突
+            File(aptEtc, "sources.list.d").takeIf { it.isDirectory }?.listFiles()?.forEach { runCatching { it.delete() } }
+            File(aptEtc, "sources.list").writeText(APT_SOURCES.first() + "\n")
+        }
+    }
+
+    private fun installPortablePkgWrapper() {
+        val pkg = File(root, "bin/pkg")
+        runCatching {
+            pkg.delete()
+            pkg.writeText("#!/bin/bash\nexport PREFIX=\"$prefix\"\nexport TERMUX_PREFIX=\"$prefix\"\nexport HOME=\"$home\"\nexport PATH=\"$prefix/bin:$prefix/bin/applets:/system/bin:/system/xbin\"\ncase \"$1\" in\n  install|reinstall|remove|uninstall|update|upgrade|full-upgrade|search|show|list) exec $prefix/bin/apt \"$@\" ;;\n  *) exec $prefix/bin/apt \"$@\" ;;\nesac\n")
+            pkg.setExecutable(true, false)
+            pkg.setReadable(true, false)
+        }
+    }
+
+    /** 递归设置目录权限为 755。 */
+    private fun setDirPermissionsRecursive(dir: File) {
+        dir.walkTopDown().forEach { f ->
+            try {
+                if (f.isDirectory) {
+                    f.setExecutable(true, false)
+                    f.setReadable(true, false)
+                }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    /**
+     * 强制修复 runtime 下所有文件的可执行权限。
+     * APK 解压后原生二进制可能丢失 exec 位（error=13 Permission denied），
+     * 此方法遍历 bin/、libexec/、lib/ 下所有文件并设置 755 权限。
+     * 同时尝试通过 Shizuku 以 shell 用户身份执行 chmod（更可靠）。
+     */
+    private fun forceFixPermissions() {
+        // 方案一：Java 层 setExecutable + Android 系统 chmod。
+        // 某些 Android 设备/ROM 在 ZIP 解压后不会保留 exec 位，导致
+        // /system/bin/sh: .../bin/apt: Permission denied。
+        val dirs = listOf("bin", "libexec", "lib", "share")
+        for (sub in dirs) {
+            val d = File(root, sub)
+            if (!d.exists()) continue
+            d.walkTopDown().forEach { f ->
+                try {
+                    f.setReadable(true, false)
+                    f.setWritable(true, false)
+                    if (f.isFile) {
+                        // 对 bin/ 和 libexec/ 下的文件设置可执行
+                        if (sub == "bin" || sub == "libexec" || sub == "lib") {
+                            f.setExecutable(true, false)
+                        }
+                    }
+                    if (f.isDirectory) {
+                        f.setExecutable(true, false)
+                    }
+                } catch (_: Throwable) {}
+            }
+        }
+        // 确保 bash 本身有执行权限
+        try {
+            val bash = File(root, "bin/bash")
+            if (bash.exists()) {
+                bash.setExecutable(true, false)
+                bash.setReadable(true, false)
+            }
+        } catch (_: Throwable) {}
+
+        // 方案二：直接调用 Android 自带 chmod。先于 Shizuku 执行，避免
+        // shell/UserService 继承到错误的文件 mode。
+        runCatching {
+            val chmod = ProcessBuilder("/system/bin/chmod", "-R", "755", File(root, "bin").absolutePath, File(root, "libexec").absolutePath)
+                .redirectErrorStream(true).start()
+            chmod.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
+        }
+        // .so 不需要执行位；保留 644。
+        runCatching {
+            ProcessBuilder("/system/bin/chmod", "-R", "755", File(root, "lib").absolutePath)
+                .redirectErrorStream(true).start().waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
+        }
+
+        // 方案三：如果有 Shizuku，用 shell 用户 chmod（更可靠）
+        try {
+            if (ShizukuShell.isServiceAvailable() && ShizukuShell.hasPermission()) {
+                val runtimePath = root.absolutePath
+                val cmd = "chmod -R 755 ${runtimePath}/bin ${runtimePath}/libexec ${runtimePath}/lib 2>/dev/null; " +
+                          "echo __done__"
+                ShizukuShell.execAsApp(cmd, timeoutSec = 30)
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun relativeToRoot(target: String): String {
+        val t = target.removePrefix("./")
+        return if (t.startsWith(TERMUX_PREFIX)) t.removePrefix(TERMUX_PREFIX).removePrefix("/")
+        else t
+    }
+
+    /** 在内置运行时中执行一条命令（非交互）。
+     *  方案二：优先用 /system/bin/sh 执行（绕过 bash linker 兼容性问题）。
+     *  如果 pkg 等脚本需要 bash 特性，通过 sh -c "bash -c '...'" 间接调用。
+     */
+    fun run(command: String): String {
+        if (!isInstalled()) return ""
+        return try {
+            // 方案二：用系统 sh 执行，设置 PATH 指向 runtime/bin
+            val shPath = "/system/bin/sh"
+            val pb = ProcessBuilder(shPath, "-c", command)
+            pb.environment().putAll(env())
+            // 确保 SHELL 指向 runtime bash（供脚本内部引用）
+            pb.environment()["SHELL"] = "${root.absolutePath}/bin/bash"
+            pb.redirectErrorStream(true)
+            val p = pb.start()
+            val out = p.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            p.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)
+            out.trim()
+        } catch (_: Throwable) { "" }
+    }
+
+    /**
+     * 启动交互式终端（方案二）。
+     * 使用 /system/bin/sh -i 作为交互式 shell，绕过 bash 二进制的 linker 兼容性问题。
+     * 通过 ENV 设置 PATH/LD_LIBRARY_PATH 指向 runtime，使 pkg/git 等工具可用。
+     * 返回 Process 或 null。
+     */
+    fun startInteractive(): Process? {
+        if (!isInstalled()) return null
+        try { forceFixPermissions() } catch (_: Throwable) {}
+        return try {
+            // 先尝试 bash 直接执行（某些设备可能支持）
+            if (canDirectExecBash()) {
+                val bash = File(root, "bin/bash").absolutePath
+                val pb = ProcessBuilder(bash, "--rcfile", File(home, ".bashrc").absolutePath, "-i")
+                pb.environment().putAll(env())
+                pb.environment()["SHELL"] = bash
+                pb.directory(home)
+                pb.redirectErrorStream(true)
+                return pb.start()
+            }
+            // 兜底：用系统 sh 作为交互式 shell
+            val shPath = "/system/bin/sh"
+            val pb = ProcessBuilder(shPath, "-i")
+            pb.environment().putAll(env())
+            pb.environment()["SHELL"] = "${root.absolutePath}/bin/bash"
+            pb.environment()["PS1"] = "\\u@githubk:\\w\\$ "
+            pb.directory(home)
+            pb.redirectErrorStream(true)
+            pb.start()
+        } catch (_: Throwable) { null }
+    }
+
+    /** 测试 bash 是否可直接 exec（无 linker 错误）。 */
+    private fun canDirectExecBash(): Boolean {
+        // 测试前先确保权限
+        try { forceFixPermissions() } catch (_: Throwable) {}
+        val bash = File(root, "bin/bash").absolutePath
+        return try {
+            val pb = ProcessBuilder(bash, "-c", "echo __ok__")
+            pb.environment().putAll(env())
+            pb.redirectErrorStream(true)
+            val p = pb.start()
+            val out = p.inputStream.bufferedReader().readText().trim()
+            p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+            out.contains("__ok__")
+        } catch (_: Throwable) { false }
+    }
+
+    /** 检测工具是否已安装。 */
+    fun detectTool(cmd: String): Pair<Boolean, String> {
+        if (!isInstalled()) return false to "内置环境未安装"
+        val out = run("command -v $cmd >/dev/null 2>&1 && $cmd --version 2>&1 | head -1; true").trim()
+        if (out.isBlank()) return false to "未安装"
+        return true to out.take(60)
+    }
+
+    /**
+     * 验证 runtime 是否可用（方案二：通过 /system/bin/sh 执行）。
+     * 返回 true=runtime 可用，false=不可用。
+     */
+    fun canDirectExec(): Boolean {
+        if (!isInstalled()) return false
+        return try {
+            // 方案二：用系统 sh 检测，设置 PATH 指向 runtime
+            val pb = ProcessBuilder("/system/bin/sh", "-c", "echo __ok__")
+            pb.environment().putAll(env())
+            pb.redirectErrorStream(true)
+            val p = pb.start()
+            val out = p.inputStream.bufferedReader().readText().trim()
+            p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+            out.contains("__ok__")
+        } catch (_: Throwable) { false }
+    }
+
+    /**
+     * 修复所有脚本：
+     * 1. 修复 shebang 路径（#! 行）
+     * 2. 递归替换脚本内容中的硬编码旧路径
+     * 3. 恢复可执行权限
+     */
+    private fun fixShebangs() {
+        val binDir = File(root, "bin")
+        val libexecDir = File(root, "libexec")
+        val aptDir = File(root, "lib/apt")
+        val targetPrefix = "/data/data/com.example.myempty.githubk/files/runtime"
+        val targetShebang = "#!/system/bin/sh"
+        val oldPrefix = "/data/data/com.termux/files/usr"
+
+        // 待修复的目录集合
+        val dirs = listOfNotNull(binDir, libexecDir, aptDir)
+
+        for (dir in dirs) {
+            if (!dir.exists()) continue
+            dir.walkTopDown().forEach { file ->
+                if (file.isFile && file.canRead()) {
+                    try {
+                        val content = file.readText(Charsets.UTF_8)
+                        var modified = false
+                        var newContent = content
+
+                        // 1. 修复 shebang（#! 行）
+                        val firstLine = content.lines().firstOrNull() ?: ""
+                        if (firstLine.startsWith("#!") && firstLine.contains("/data/data/")) {
+                            newContent = newContent.replaceFirst(firstLine, targetShebang)
+                            modified = true
+                        }
+
+                        // 2. 替换内容中的硬编码旧路径
+                        if (newContent.contains(oldPrefix)) {
+                            newContent = newContent.replace(oldPrefix, targetPrefix)
+                            modified = true
+                        }
+
+                        // 3. 如果有修改则写回文件
+                        if (modified) {
+                            file.writeText(newContent, Charsets.UTF_8)
+                            // 恢复可执行位和可读位
+                            try { file.setExecutable(true, false) } catch (_: Throwable) {}
+                            try { file.setReadable(true, false) } catch (_: Throwable) {}
+                        }
+                    } catch (_: Throwable) {
+                        // 非文本文件或读取失败，忽略
+                    }
+                }
+            }
+        }
+
+        // 再次确保关键符号链接存在
+        try {
+            val shLink = File(root, "bin/sh")
+            if (!shLink.exists()) {
+                Files.createSymbolicLink(shLink.toPath(), File(root, "bin/bash").toPath())
+            }
+        } catch (_: Throwable) {}
+        try {
+            val envLink = File(root, "bin/env")
+            if (!envLink.exists()) {
+                val target = File("/system/bin/env")
+                if (target.exists()) {
+                    Files.createSymbolicLink(envLink.toPath(), target.toPath())
+                } else {
+                    val busybox = File(root, "bin/busybox")
+                    if (busybox.exists()) {
+                        Files.createSymbolicLink(envLink.toPath(), busybox.toPath())
+                    }
+                }
+            }
+        } catch (_: Throwable) {}
+    }
+
+    private fun ensureRuntimeExecutable(file: File, onOutput: (String) -> Unit) {
+        if (!file.exists()) {
+            onOutput("[ENV] 缺少 ${file.name}：${file.absolutePath}\n")
+            return
+        }
+        runCatching { file.setExecutable(true, false) }
+        runCatching {
+            ProcessBuilder("/system/bin/chmod", "755", file.absolutePath).redirectErrorStream(true).start().waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+        }
+        if (!file.canExecute()) {
+            onOutput("[ENV] ${file.name} 仍不可执行，设备可能禁止 app 私有目录执行原生文件。\n")
+        }
+    }
+
+    /** 在内置 Termux-compatible prefix 中初始化软件源并安装开发工具。 */
+    fun installPackages(packages: List<String>, onOutput: (String) -> Unit = {}): Boolean {
+        if (!isInstalled()) throw IllegalStateException("内置终端运行时尚未安装")
+        if (packages.isEmpty()) return true
+        prepare()
+        forceFixPermissions()
+        // 在 apt update 前先验证 apt 本身可执行。若 ROM/解压流程丢失 exec 位，
+        // 立即修复而不是让后续所有包安装连续失败。
+        ensureRuntimeExecutable(File(root, "bin/apt"), onOutput)
+        ensureRuntimeExecutable(File(root, "bin/apt-get"), onOutput)
+        val candidates = APT_SOURCES.joinToString(" ") { "'" + it.replace("'", "'\\''") + "'" }
+        val cmd = buildString {
+            append("export DEBIAN_FRONTEND=noninteractive; ")
+            append("export PREFIX='").append(prefix.replace("'", "'\\''")).append("'; ")
+            append("export HOME='").append(home.absolutePath.replace("'", "'\\''")).append("'; ")
+            append("export PATH='").append(prefix).append("/bin:").append(prefix).append("/bin/applets:/system/bin:/system/xbin'; ")
+            append("export TMPDIR='").append(tmp.absolutePath.replace("'", "'\\''")).append("'; ")
+            append("command -v apt >/dev/null 2>&1 || { echo '[ENV] apt 不存在，请重新安装内置运行时'; exit 127; }; ")
+            // 已有有效软件源则保留（尊重 ZeroTermux 镜像选择）；否则写入国内镜像
+            append("if ! grep -q '^deb ' \"\$PREFIX/etc/apt/sources.list\" 2>/dev/null; then rm -rf \"\$PREFIX/etc/apt/sources.list.d\"; mkdir -p \"\$PREFIX/etc/apt\"; echo '").append(APT_SOURCES.first().replace("'", "'\\''")).append("' > \"\$PREFIX/etc/apt/sources.list\"; fi; ")
+            // apt update 失败则逐个切换镜像重试
+            append("apt-get update -y || { ok=0; for src in ").append(candidates).append("; do echo \"\$src\" > \"\$PREFIX/etc/apt/sources.list\"; if apt-get update -y; then ok=1; break; fi; echo '[ENV] 软件源不可用，尝试下一个镜像'; done; [ \"\$ok\" = 1 ] || { echo '[ENV] 所有软件源均不可用'; exit 1; }; }; ")
+            append("apt-get install -y ")
+            packages.forEach { append(it.filter { ch -> ch.isLetterOrDigit() || ch in "-_+." }).append(' ') }
+        }
+        return runStreaming(cmd, onOutput)
+    }
+
+    /** 安装 Android IDE 常用工具链：JDK、Gradle、Git、Python、Node.js。 */
+    fun installIdeToolchain(onOutput: (String) -> Unit = {}): Boolean =
+        installPackages(listOf("openjdk-17", "gradle", "git", "python", "nodejs"), onOutput)
+
+    /** 非交互执行并实时回传输出，避免 readText() 导致 UI 看起来像卡死。 */
+    private fun runStreaming(command: String, onOutput: (String) -> Unit): Boolean {
+        try { forceFixPermissions() } catch (_: Throwable) {}
+        return try {
+            if (ShizukuShell.isServiceAvailable() && ShizukuShell.hasPermission()) {
+                onOutput("[ENV] Shizuku UserService → run-as → built-in runtime\n")
+                val result = ShizukuShell.execUserService(c, command, env(), root.absolutePath, 30 * 60)
+                if (result != null) {
+                    result.lineSequence().forEach { onOutput(it + "\n") }
+                    val code = Regex("\\[exit=(\\d+)\\]").find(result)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    return code == null || code == 0
+                }
+            }
+            val pb = ProcessBuilder("/system/bin/sh", "-c", command)
+            pb.environment().putAll(env())
+            pb.environment()["SHELL"] = File(root, "bin/bash").absolutePath
+            pb.redirectErrorStream(true)
+            val p = pb.start()
+            p.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines -> lines.forEach { onOutput(it + "\n") } }
+            p.waitFor(30, java.util.concurrent.TimeUnit.MINUTES)
+            p.exitValue() == 0
+        } catch (e: Throwable) {
+            onOutput("[ENV] ${e.message ?: e.javaClass.simpleName}\n")
+            false
+        }
+    }
+
+    /** 删除损坏的 runtime 后可安全重装。 */
+    fun reset() {
+        try { root.deleteRecursively() } catch (_: Throwable) {}
+    }
+
+}
