@@ -1,0 +1,12 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- GitHubK Studio: terminal prompt + code bracket + K monogram -->
+    <path android:fillColor="#111827" android:pathData="M54,4A50,50 0,1 0,54 104A50,50 0,1 0,54 4"/>
+    <path android:fillColor="#60A5FA" android:pathData="M24,34 L40,50 L24,66 L19,61 L30,50 L19,39 Z"/>
+    <path android:fillColor="#F8FAFC" android:pathData="M43,64 L54,36 L61,36 L50,64 Z"/>
+    <path android:fillColor="#34D399" android:pathData="M65,34 L71,34 L71,46 L84,34 L91,34 L76,50 L91,66 L84,66 L71,54 L71,66 L65,66 Z"/>
+    <path android:fillColor="#FFFFFF" android:pathData="M24,78 L84,78 L84,83 L24,83 Z"/>
+</vector>
